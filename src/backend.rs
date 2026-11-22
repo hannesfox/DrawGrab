@@ -310,3 +310,47 @@ fn merge_v(segs: &mut Vec<VSeg>) -> Vec<VSeg> {
     }
     out
 }
+
+
+/// Rendert eine PDF-Seite in ein RGBA-Bild (für die Teach-In-Vorschau) und liefert
+/// gleichzeitig die extrahierten Seitendaten (Wörter, Linien).
+pub fn render_page_preview(
+    pdfium: &Pdfium,
+    path: &Path,
+    page_index: i32,
+    max_width: u32,
+) -> Result<(u32, u32, Vec<u8>, PageData), String> {
+    let document = pdfium
+        .load_pdf_from_file(path, None)
+        .map_err(|e| format!("PDF konnte nicht geöffnet werden: {e}"))?;
+
+    let page = document
+        .pages()
+        .get(page_index)
+        .map_err(|e| format!("Seite {page_index} nicht lesbar: {e}"))?;
+
+    let size = page.page_size();
+    let page_h = size.height().value;
+    let page_w = size.width().value;
+
+    let target_w = (max_width.max(800)) as i32;
+    let target_h = ((target_w as f32) * (page_h / page_w)).round() as i32;
+
+    let bitmap = page
+        .render(target_w, target_h, None)
+        .map_err(|e| format!("Seite konnte nicht gerendert werden: {e}"))?;
+
+    let rgba = bitmap.as_rgba_bytes();
+    let words = extract_words(&page, page_h)?;
+    let (hsegs, vsegs) = extract_segments(&page, page_h);
+
+    let pdata = PageData {
+        width: page_w,
+        height: page_h,
+        words,
+        hsegs,
+        vsegs,
+    };
+
+    Ok((target_w as u32, target_h as u32, rgba, pdata))
+}

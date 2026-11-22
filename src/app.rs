@@ -1,11 +1,12 @@
 //! Grafische Oberfläche: Dateien per Drag & Drop sammeln, auswerten, Tabelle prüfen,
-//! als CSV exportieren.
+//! als CSV exportieren sowie interaktives Anlernen neuer Vorlagen (Teach-In).
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use crate::{backend, extract, pdfium_loader};
+use crate::template::{self, NormalizedRect, Template};
+use crate::{backend, pdfium_loader};
 use eframe::egui;
 
 /// Eine Zeile der Ergebnistabelle.
@@ -45,12 +46,14 @@ impl Row {
 }
 
 enum Command {
-    Process(Vec<PathBuf>),
+    Process(Vec<PathBuf>, Option<String>, Vec<Template>),
+    RenderPreview(PathBuf),
 }
 
 enum Event {
     Done(PathBuf, Vec<(String, String)>, Vec<String>),
     Failed(PathBuf, String),
+    PreviewReady(PathBuf, Result<(u32, u32, Vec<u8>, backend::PageData), String>),
 }
 
 pub fn run() {
@@ -70,6 +73,84 @@ pub fn run() {
     .expect("Fenster konnte nicht geöffnet werden");
 }
 
+#[derive(Clone)]
+struct TeachInField {
+    key: &'static str,
+    label: &'static str,
+    color: egui::Color32,
+    rect: Option<NormalizedRect>,
+    preview_text: String,
+}
+
+struct TeachInState {
+    is_open: bool,
+    pdf_path: Option<PathBuf>,
+    texture: Option<egui::TextureHandle>,
+    page_data: Option<backend::PageData>,
+    image_width: f32,
+    image_height: f32,
+    active_field_index: usize,
+    fields: [TeachInField; 4],
+    drag_start: Option<egui::Pos2>,
+    drag_current: Option<egui::Pos2>,
+    template_name: String,
+    zoom: f32,
+    pan: egui::Vec2,
+    status_msg: String,
+    loading: bool,
+}
+
+impl Default for TeachInState {
+    fn default() -> Self {
+        Self {
+            is_open: false,
+            pdf_path: None,
+            texture: None,
+            page_data: None,
+            image_width: 800.0,
+            image_height: 600.0,
+            active_field_index: 0,
+            fields: [
+                TeachInField {
+                    key: "zeichnung",
+                    label: "Zeichnungsnummer",
+                    color: egui::Color32::from_rgb(33, 150, 243), // Blau
+                    rect: None,
+                    preview_text: String::new(),
+                },
+                TeachInField {
+                    key: "bezeichnung",
+                    label: "Bezeichnung",
+                    color: egui::Color32::from_rgb(76, 175, 80), // Grün
+                    rect: None,
+                    preview_text: String::new(),
+                },
+                TeachInField {
+                    key: "material",
+                    label: "Material",
+                    color: egui::Color32::from_rgb(255, 152, 0), // Orange
+                    rect: None,
+                    preview_text: String::new(),
+                },
+                TeachInField {
+                    key: "oberflaeche",
+                    label: "Oberflächenbehandlung",
+                    color: egui::Color32::from_rgb(156, 39, 176), // Lila
+                    rect: None,
+                    preview_text: String::new(),
+                },
+            ],
+            drag_start: None,
+            drag_current: None,
+            template_name: String::new(),
+            zoom: 0.6,
+            pan: egui::Vec2::new(20.0, 20.0),
+            status_msg: "Wähle eine Beispiel-PDF-Zeichnung aus, um zu beginnen.".to_string(),
+            loading: false,
+        }
+    }
+}
+
 struct DrawGrabApp {
     rows: Vec<Row>,
     /// Dateien, die hinzugefügt wurden, aber noch nicht ausgewertet sind
@@ -78,6 +159,9 @@ struct DrawGrabApp {
     rx: Receiver<Event>,
     status_text: String,
     reset_table_columns: bool,
+    templates: Vec<Template>,
+    selected_template_id: Option<String>,
+    teach_in: TeachInState,
 }
 
 impl DrawGrabApp {
@@ -102,11 +186,15 @@ impl DrawGrabApp {
 
                 while let Ok(command) = rx_cmd.recv() {
                     match command {
-                        Command::Process(files) => {
+                        Command::Process(files, template_id, templates) => {
                             for file in files {
                                 match backend::load_pages(&pdfium, &file) {
                                     Ok(pages) => {
-                                        let result = extract::extract(&pages);
+                                        let result = template::extract_with_mode(
+                                            &pages,
+                                            &templates,
+                                            template_id.as_deref(),
+                                        );
                                         if tx_event
                                             .send(Event::Done(
                                                 file.clone(),
@@ -126,10 +214,16 @@ impl DrawGrabApp {
                                 }
                             }
                         }
+                        Command::RenderPreview(file) => {
+                            let result = backend::render_page_preview(&pdfium, &file, 0, 1600);
+                            let _ = tx_event.send(Event::PreviewReady(file, result));
+                        }
                     }
                 }
             })
             .expect("Hintergrund-Thread konnte nicht gestartet werden");
+
+        let templates = template::load_templates();
 
         DrawGrabApp {
             rows: Vec::new(),
@@ -138,6 +232,9 @@ impl DrawGrabApp {
             rx: rx_event,
             status_text: "Bereit – ziehe Zeichnungen (PDF) hierher.".to_string(),
             reset_table_columns: false,
+            templates,
+            selected_template_id: None,
+            teach_in: TeachInState::default(),
         }
     }
 
@@ -172,13 +269,31 @@ impl DrawGrabApp {
                 row.status = Status::Wartend;
             }
         }
-        if self.tx.send(Command::Process(files)).is_ok() {
-            self.status_text = format!("{count} Datei(en) werden ausgewertet …");
+        if self
+            .tx
+            .send(Command::Process(
+                files,
+                self.selected_template_id.clone(),
+                self.templates.clone(),
+            ))
+            .is_ok()
+        {
+            let tmpl_info = match &self.selected_template_id {
+                None => "automatische Vorlagenerkennung".to_string(),
+                Some(id) if id == "none" => "Standard-Heuristik".to_string(),
+                Some(id) => self
+                    .templates
+                    .iter()
+                    .find(|t| &t.id == id)
+                    .map(|t| format!("Vorlage „{}“", t.name))
+                    .unwrap_or_else(|| "Vorlage".to_string()),
+            };
+            self.status_text = format!("{count} Datei(en) werden ausgewertet ({tmpl_info}) …");
         }
     }
 
     /// Holt Ergebnisse aus dem Hintergrund-Thread. Gibt die Anzahl neuer Ereignisse zurück.
-    fn poll_events(&mut self) -> usize {
+    fn poll_events(&mut self, ctx: &egui::Context) -> usize {
         let mut processed = 0usize;
         while let Ok(event) = self.rx.try_recv() {
             match event {
@@ -204,6 +319,44 @@ impl DrawGrabApp {
                 Event::Failed(path, message) => {
                     if let Some(row) = self.rows.iter_mut().find(|r| r.path == path) {
                         row.status = Status::Fehler(message);
+                    }
+                    processed += 1;
+                }
+                Event::PreviewReady(path, result) => {
+                    self.teach_in.loading = false;
+                    match result {
+                        Ok((w, h, rgba, pdata)) => {
+                            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                [w as usize, h as usize],
+                                &rgba,
+                            );
+                            self.teach_in.texture = Some(ctx.load_texture(
+                                "teach_in_preview",
+                                color_image,
+                                egui::TextureOptions::LINEAR,
+                            ));
+                            self.teach_in.image_width = w as f32;
+                            self.teach_in.image_height = h as f32;
+                            self.teach_in.page_data = Some(pdata);
+                            self.teach_in.status_msg = format!(
+                                "Zeichnung geladen: {}",
+                                path.file_name().unwrap_or_default().to_string_lossy()
+                            );
+                            self.teach_in.zoom = 0.55;
+                            self.teach_in.pan = egui::Vec2::new(20.0, 20.0);
+
+                            // Wenn Felder bereits markiert waren, Text neu extrahieren
+                            if let Some(ref pd) = self.teach_in.page_data {
+                                for f in self.teach_in.fields.iter_mut() {
+                                    if let Some(r) = f.rect {
+                                        f.preview_text = template::extract_field_text(pd, &r);
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.teach_in.status_msg = format!("Fehler beim Laden: {e}");
+                        }
                     }
                     processed += 1;
                 }
@@ -279,18 +432,484 @@ impl DrawGrabApp {
             Err(e) => self.status_text = format!("CSV konnte nicht gespeichert werden: {e}"),
         }
     }
+
+    /// Zeigt den Teach-In-Dialog zum interaktiven Anlernen neuer Vorlagen.
+    fn show_teach_in_window(&mut self, ctx: &egui::Context) {
+        let mut is_open = self.teach_in.is_open;
+        egui::Window::new("🎓 Teach-In: Zeichnungsvorlage interaktiv anlernen")
+            .open(&mut is_open)
+            .resizable(true)
+            .collapsible(false)
+            .default_size([1320.0, 800.0])
+            .min_size([920.0, 600.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("📄 Beispiel-PDF wählen …").clicked() {
+                        if let Some(file) = rfd::FileDialog::new()
+                            .set_title("Beispiel-Zeichnung (PDF) für Vorlage wählen")
+                            .add_filter("Zeichnungen (PDF)", &["pdf"])
+                            .pick_file()
+                        {
+                            self.teach_in.pdf_path = Some(file.clone());
+                            self.teach_in.loading = true;
+                            self.teach_in.status_msg = format!(
+                                "Lade {} …",
+                                file.file_name().unwrap_or_default().to_string_lossy()
+                            );
+                            if self.teach_in.template_name.is_empty() {
+                                self.teach_in.template_name = file
+                                    .file_stem()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "Neue Vorlage".to_string());
+                            }
+                            let _ = self.tx.send(Command::RenderPreview(file));
+                        }
+                    }
+
+                    if let Some(ref path) = self.teach_in.pdf_path {
+                        ui.label(format!(
+                            "Geladen: {}",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        ));
+                    } else {
+                        ui.label("Keine PDF geladen");
+                    }
+
+                    ui.separator();
+                    ui.label(&self.teach_in.status_msg);
+                });
+
+                ui.separator();
+
+                ui.columns(2, |columns| {
+                    // --- Linke Spalte: Steuerleiste & Felder (360 px) ---
+                    let left = &mut columns[0];
+                    left.set_max_width(380.0);
+
+                    left.heading("1. Schriftfeld markieren");
+                    left.label(
+                        "Wähle ein Feld aus und ziehe mit der Maus im rechten Plan ein Rechteck darum auf:",
+                    );
+                    left.add_space(4.0);
+
+                    let mut remove_field_idx = None;
+                    let mut select_field_idx = None;
+
+                    for i in 0..4 {
+                        let is_active = self.teach_in.active_field_index == i;
+                        let label = self.teach_in.fields[i].label;
+                        let field_color = self.teach_in.fields[i].color;
+                        let has_rect = self.teach_in.fields[i].rect.is_some();
+                        let rect_opt = self.teach_in.fields[i].rect;
+                        let preview_text = self.teach_in.fields[i].preview_text.clone();
+
+                        left.horizontal(|ui| {
+                            let text = if is_active {
+                                format!("👉 {label}")
+                            } else {
+                                label.to_string()
+                            };
+
+                            let btn = egui::Button::new(
+                                egui::RichText::new(text).color(if is_active {
+                                    egui::Color32::WHITE
+                                } else {
+                                    field_color
+                                }),
+                            )
+                            .fill(if is_active {
+                                field_color
+                            } else {
+                                ui.visuals().widgets.inactive.bg_fill
+                            });
+
+                            if ui.add(btn).clicked() {
+                                select_field_idx = Some(i);
+                            }
+
+                            if has_rect {
+                                ui.colored_label(egui::Color32::from_rgb(0x4c, 0xaf, 0x50), "✔");
+                                if ui.small_button("✕").on_hover_text("Markierung entfernen").clicked() {
+                                    remove_field_idx = Some(i);
+                                }
+                            } else {
+                                ui.colored_label(ui.visuals().weak_text_color(), "⚪");
+                            }
+                        });
+
+                        // Vorschautext anzeigen
+                        if let Some(r) = rect_opt {
+                            left.indent(format!("preview_{i}"), |ui| {
+                                let coord_info = format!(
+                                    "Bereich: X {:.1}%..{:.1}%, Y {:.1}%..{:.1}%",
+                                    r.x0 * 100.0,
+                                    r.x1 * 100.0,
+                                    r.y0 * 100.0,
+                                    r.y1 * 100.0
+                                );
+                                ui.small(coord_info);
+                                if preview_text.is_empty() {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(0xb2, 0x6a, 0x00),
+                                        "Kein Text im Bereich erkannt",
+                                    );
+                                } else {
+                                    ui.monospace(format!("„{preview_text}“"));
+                                }
+                            });
+                        }
+                        left.add_space(3.0);
+                    }
+
+                    if let Some(idx) = select_field_idx {
+                        self.teach_in.active_field_index = idx;
+                    }
+                    if let Some(idx) = remove_field_idx {
+                        self.teach_in.fields[idx].rect = None;
+                        self.teach_in.fields[idx].preview_text.clear();
+                    }
+
+                    left.separator();
+                    left.heading("2. Vorlage speichern");
+                    left.horizontal(|ui| {
+                        ui.label("Name:");
+                        ui.text_edit_singleline(&mut self.teach_in.template_name);
+                    });
+
+                    left.add_space(4.0);
+                    if left
+                        .button(egui::RichText::new("💾 Vorlage speichern & aktivieren").strong())
+                        .clicked()
+                    {
+                        if self.teach_in.template_name.trim().is_empty() {
+                            self.teach_in.status_msg =
+                                "Bitte einen Namen für die Vorlage vergeben!".to_string();
+                        } else if self.teach_in.fields.iter().all(|f| f.rect.is_none()) {
+                            self.teach_in.status_msg =
+                                "Bitte mindestens ein Schriftfeld auf dem Plan markieren!"
+                                    .to_string();
+                        } else {
+                            let mut tmpl = Template::new(&self.teach_in.template_name);
+                            for f in &self.teach_in.fields {
+                                if let Some(r) = f.rect {
+                                    tmpl.set_field(f.key, f.label, r);
+                                }
+                            }
+                            let tmpl_id = tmpl.id.clone();
+                            let tmpl_name = tmpl.name.clone();
+
+                            if let Some(existing) =
+                                self.templates.iter_mut().find(|t| t.name == tmpl.name)
+                            {
+                                *existing = tmpl;
+                            } else {
+                                self.templates.push(tmpl);
+                            }
+
+                            if let Err(e) = template::save_templates(&self.templates) {
+                                self.teach_in.status_msg =
+                                    format!("Fehler beim Speichern: {e}");
+                            } else {
+                                self.selected_template_id = Some(tmpl_id);
+                                self.teach_in.status_msg =
+                                    format!("Vorlage „{tmpl_name}“ erfolgreich gespeichert!");
+                                self.status_text =
+                                    format!("Vorlage „{tmpl_name}“ aktiv.");
+                            }
+                        }
+                    }
+
+                    left.separator();
+                    left.collapsing(
+                        format!("📁 Gespeicherte Vorlagen ({})", self.templates.len()),
+                        |ui| {
+                            if self.templates.is_empty() {
+                                ui.label("Noch keine Vorlagen angelernt.");
+                            } else {
+                                let mut to_delete = None;
+                                for (idx, tmpl) in self.templates.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.label(format!("📐 {}", tmpl.name));
+                                        if ui
+                                            .button("🗑")
+                                            .on_hover_text("Vorlage löschen")
+                                            .clicked()
+                                        {
+                                            to_delete = Some(idx);
+                                        }
+                                    });
+                                }
+                                if let Some(idx) = to_delete {
+                                    self.templates.remove(idx);
+                                    let _ = template::save_templates(&self.templates);
+                                    self.selected_template_id = None;
+                                }
+                            }
+                        },
+                    );
+
+                    // --- Rechte Spalte: Interaktiver Canvas (Zoom / Pan / Bounding Box) ---
+                    let right = &mut columns[1];
+
+                    right.horizontal(|ui| {
+                        if ui.button("➖ Zoom -").clicked() {
+                            self.teach_in.zoom = (self.teach_in.zoom * 0.85).max(0.15);
+                        }
+                        if ui.button("100%").clicked() {
+                            self.teach_in.zoom = 0.55;
+                        }
+                        if ui.button("➕ Zoom +").clicked() {
+                            self.teach_in.zoom = (self.teach_in.zoom * 1.15).min(5.0);
+                        }
+                        if ui.button("⟲ Ansicht einpassen").clicked() {
+                            self.teach_in.zoom = 0.45;
+                            self.teach_in.pan = egui::Vec2::new(10.0, 10.0);
+                        }
+                        ui.separator();
+                        ui.small("💡 Linksklick = Rahmen aufziehen | Rechtsklick = Plan verschieben | Mausrad = Zoomen");
+                    });
+
+                    let canvas_size = right.available_size();
+                    let (response, painter) =
+                        right.allocate_painter(canvas_size, egui::Sense::click_and_drag());
+                    let canvas_rect = response.rect;
+
+                    // 1. Zoom per Mausrad
+                    if response.hovered() {
+                        let scroll = right.input(|i| i.smooth_scroll_delta.y);
+                        if scroll != 0.0 {
+                            let factor = if scroll > 0.0 { 1.1 } else { 0.9 };
+                            self.teach_in.zoom = (self.teach_in.zoom * factor).clamp(0.15, 6.0);
+                        }
+                    }
+
+                    // 2. Pan per Rechtsklick / Mittelklick
+                    let is_panning = right.input(|i| {
+                        i.pointer.button_down(egui::PointerButton::Secondary)
+                            || i.pointer.button_down(egui::PointerButton::Middle)
+                    });
+                    if response.dragged() && is_panning {
+                        self.teach_in.pan += response.drag_delta();
+                    }
+
+                    // 3. Bildfläche berechnen
+                    let img_w = self.teach_in.image_width * self.teach_in.zoom;
+                    let img_h = self.teach_in.image_height * self.teach_in.zoom;
+                    let img_rect = egui::Rect::from_min_size(
+                        canvas_rect.min + self.teach_in.pan,
+                        egui::vec2(img_w, img_h),
+                    );
+
+                    // Hintergrund
+                    painter.rect_filled(
+                        canvas_rect,
+                        4.0,
+                        egui::Color32::from_rgb(28, 30, 34),
+                    );
+
+                    if let Some(ref texture) = self.teach_in.texture {
+                        painter.image(
+                            texture.id(),
+                            img_rect,
+                            egui::Rect::from_min_max(
+                                egui::pos2(0.0, 0.0),
+                                egui::pos2(1.0, 1.0),
+                            ),
+                            egui::Color32::WHITE,
+                        );
+                        painter.rect_stroke(
+                            img_rect,
+                            0.0,
+                            egui::Stroke::new(1.0, egui::Color32::GRAY),
+                            egui::StrokeKind::Outside,
+                        );
+                    } else {
+                        let msg = if self.teach_in.loading {
+                            "PDF wird geladen & gerendert …"
+                        } else {
+                            "Keine PDF geladen – links auf „📄 Beispiel-PDF wählen …“ klicken"
+                        };
+                        painter.text(
+                            canvas_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            msg,
+                            egui::FontId::proportional(16.0),
+                            egui::Color32::LIGHT_GRAY,
+                        );
+                    }
+
+                    // 4. Bereits konfigurierte Felder auf dem Plan einzeichnen
+                    for field in &self.teach_in.fields {
+                        if let Some(norm_rect) = field.rect {
+                            let screen_min = img_rect.min
+                                + egui::vec2(
+                                    norm_rect.x0 * img_rect.width(),
+                                    norm_rect.y0 * img_rect.height(),
+                                );
+                            let screen_max = img_rect.min
+                                + egui::vec2(
+                                    norm_rect.x1 * img_rect.width(),
+                                    norm_rect.y1 * img_rect.height(),
+                                );
+                            let field_screen_rect =
+                                egui::Rect::from_min_max(screen_min, screen_max);
+
+                            let mut fill = field.color;
+                            fill = egui::Color32::from_rgba_unmultiplied(
+                                fill.r(),
+                                fill.g(),
+                                fill.b(),
+                                45,
+                            );
+                            painter.rect_filled(field_screen_rect, 2.0, fill);
+                            painter.rect_stroke(
+                                field_screen_rect,
+                                2.0,
+                                egui::Stroke::new(2.0, field.color),
+                                egui::StrokeKind::Outside,
+                            );
+
+                            // Beschriftung über der Box
+                            let badge_text = if field.preview_text.is_empty() {
+                                field.label.to_string()
+                            } else {
+                                let snippet: String =
+                                    field.preview_text.chars().take(22).collect();
+                                format!("{}: \"{}\"", field.label, snippet)
+                            };
+                            let badge_pos = field_screen_rect.left_top() - egui::vec2(0.0, 18.0);
+                            painter.rect_filled(
+                                egui::Rect::from_min_size(
+                                    badge_pos,
+                                    egui::vec2(badge_text.len() as f32 * 7.0 + 8.0, 18.0),
+                                ),
+                                3.0,
+                                field.color,
+                            );
+                            painter.text(
+                                badge_pos + egui::vec2(4.0, 2.0),
+                                egui::Align2::LEFT_TOP,
+                                badge_text,
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                    }
+
+                    // 5. Interaktives Aufziehen mit Linksklick
+                    if self.teach_in.texture.is_some() && !is_panning {
+                        let pointer_pos = right.input(|i| i.pointer.interact_pos());
+                        let primary_down = right.input(|i| i.pointer.primary_down());
+                        let primary_clicked = response.drag_started_by(egui::PointerButton::Primary);
+                        let primary_released = right.input(|i| i.pointer.primary_released());
+
+                        if primary_clicked {
+                            if let Some(pos) = pointer_pos {
+                                if img_rect.contains(pos) {
+                                    self.teach_in.drag_start = Some(pos);
+                                    self.teach_in.drag_current = Some(pos);
+                                }
+                            }
+                        } else if primary_down && self.teach_in.drag_start.is_some() {
+                            if let Some(pos) = pointer_pos {
+                                self.teach_in.drag_current = Some(pos);
+                            }
+                        }
+
+                        // Aktuelles Live-Rechteck zeichnen
+                        if let (Some(start), Some(curr)) =
+                            (self.teach_in.drag_start, self.teach_in.drag_current)
+                        {
+                            let drag_rect = egui::Rect::from_two_pos(start, curr);
+                            let active_color =
+                                self.teach_in.fields[self.teach_in.active_field_index].color;
+                            let fill = egui::Color32::from_rgba_unmultiplied(
+                                active_color.r(),
+                                active_color.g(),
+                                active_color.b(),
+                                60,
+                            );
+                            painter.rect_filled(drag_rect, 2.0, fill);
+                            painter.rect_stroke(
+                                drag_rect,
+                                2.0,
+                                egui::Stroke::new(2.0, active_color),
+                                egui::StrokeKind::Outside,
+                            );
+                        }
+
+                        // Beim Loslassen der Maus Feld speichern
+                        if primary_released {
+                            if let (Some(start), Some(curr)) =
+                                (self.teach_in.drag_start.take(), self.teach_in.drag_current.take())
+                            {
+                                let min_x = start.x.min(curr.x);
+                                let max_x = start.x.max(curr.x);
+                                let min_y = start.y.min(curr.y);
+                                let max_y = start.y.max(curr.y);
+
+                                if (max_x - min_x) > 6.0 && (max_y - min_y) > 6.0 {
+                                    let u0 = ((min_x - img_rect.min.x) / img_rect.width())
+                                        .clamp(0.0, 1.0);
+                                    let v0 = ((min_y - img_rect.min.y) / img_rect.height())
+                                        .clamp(0.0, 1.0);
+                                    let u1 = ((max_x - img_rect.min.x) / img_rect.width())
+                                        .clamp(0.0, 1.0);
+                                    let v1 = ((max_y - img_rect.min.y) / img_rect.height())
+                                        .clamp(0.0, 1.0);
+
+                                    let norm_rect = NormalizedRect::new(u0, v0, u1, v1);
+                                    let active_idx = self.teach_in.active_field_index;
+                                    self.teach_in.fields[active_idx].rect = Some(norm_rect);
+
+                                    if let Some(ref pdata) = self.teach_in.page_data {
+                                        let text = template::extract_field_text(pdata, &norm_rect);
+                                        self.teach_in.fields[active_idx].preview_text =
+                                            text.clone();
+                                        self.teach_in.status_msg = if text.is_empty() {
+                                            format!(
+                                                "Feld „{}“ markiert (Kein Text im Bereich)",
+                                                self.teach_in.fields[active_idx].label
+                                            )
+                                        } else {
+                                            format!(
+                                                "Feld „{}“ erkannt: \"{}\"",
+                                                self.teach_in.fields[active_idx].label, text
+                                            )
+                                        };
+                                    }
+
+                                    // Zum nächsten noch unkonfigurierten Feld wechseln
+                                    if let Some(next) = (0..4)
+                                        .find(|&idx| self.teach_in.fields[idx].rect.is_none())
+                                    {
+                                        self.teach_in.active_field_index = next;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            });
+        self.teach_in.is_open = is_open;
+    }
 }
 
 impl eframe::App for DrawGrabApp {
     /// Verarbeitung ohne UI – auch wenn das Fenster gerade im Hintergrund ist.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.poll_events() > 0 {
+        if self.poll_events(ctx) > 0 {
             ctx.request_repaint();
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // Ereignisse abfragen
+        if self.poll_events(&ctx) > 0 {
+            ctx.request_repaint();
+        }
 
         // Dateien per Drag & Drop aufnehmen
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -367,6 +986,52 @@ impl eframe::App for DrawGrabApp {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                         self.add_paths(&[folder]);
                     }
+                }
+
+                ui.separator();
+
+                // Vorlagenauswahl
+                egui::ComboBox::from_label("Erkennung")
+                    .selected_text(match &self.selected_template_id {
+                        None => "🔄 Automatisch erkennen".to_string(),
+                        Some(id) if id == "none" => "⚙️ Nur Standard-Heuristik".to_string(),
+                        Some(id) => self
+                            .templates
+                            .iter()
+                            .find(|t| &t.id == id)
+                            .map(|t| format!("📐 {}", t.name))
+                            .unwrap_or_else(|| "Unbekannte Vorlage".to_string()),
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.selected_template_id,
+                            None,
+                            "🔄 Automatisch erkennen (empfohlen)",
+                        );
+                        ui.selectable_value(
+                            &mut self.selected_template_id,
+                            Some("none".to_string()),
+                            "⚙️ Nur Standard-Heuristik",
+                        );
+                        if !self.templates.is_empty() {
+                            ui.separator();
+                            for tmpl in &self.templates {
+                                ui.selectable_value(
+                                    &mut self.selected_template_id,
+                                    Some(tmpl.id.clone()),
+                                    format!("📐 {}", tmpl.name),
+                                );
+                            }
+                        }
+                    });
+
+                // Button für Teach-In Modus
+                if ui
+                    .button(egui::RichText::new("🎓 Vorlage anlernen …").strong())
+                    .on_hover_text("Interaktives Anlernen eines neuen Schriftfeld-Layouts per Mausauswahl")
+                    .clicked()
+                {
+                    self.teach_in.is_open = true;
                 }
 
                 ui.separator();
@@ -464,8 +1129,7 @@ impl eframe::App for DrawGrabApp {
                                 body.row(28.0, |mut row_ui| {
                                     row_ui.col(|ui| {
                                         ui.label(file_name.as_str()).on_hover_text(format!(
-                                            "Datei: {file_name}
-Pfad: {}",
+                                            "Datei: {file_name}\nPfad: {}",
                                             path.display()
                                         ));
                                     });
@@ -546,6 +1210,11 @@ Pfad: {}",
             self.rows = rows;
             self.neu = neu_flag;
         });
+
+        // Teach-In Dialog anzeigen, wenn geöffnet
+        if self.teach_in.is_open {
+            self.show_teach_in_window(&ctx);
+        }
     }
 }
 

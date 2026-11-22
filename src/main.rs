@@ -7,6 +7,7 @@ mod app;
 mod backend;
 mod extract;
 mod pdfium_loader;
+mod template;
 
 use std::path::{Path, PathBuf};
 

@@ -15,6 +15,8 @@ egui_extras = "0.37"
 pdfium-render = "0.9.5"
 csv = "1.4"
 rfd = "0.18"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [build-dependencies]
 flate2 = "1"
