@@ -150,9 +150,8 @@ fn extract_words(page: &PdfPage, page_h: f32) -> Result<Vec<Word>, String> {
 fn chars_to_words(chars: &mut [CharInfo]) -> Vec<Word> {
     chars.sort_by(|a, b| {
         a.baseline
-            .partial_cmp(&b.baseline)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.x0.partial_cmp(&b.x0).unwrap_or(std::cmp::Ordering::Equal))
+            .total_cmp(&b.baseline)
+            .then_with(|| a.x0.total_cmp(&b.x0))
     });
 
     // 1) Zeichen in Zeilen (gleiche Grundlinie) gruppieren
@@ -168,7 +167,7 @@ fn chars_to_words(chars: &mut [CharInfo]) -> Vec<Word> {
     // 2) Zeichen in Wörter zerlegen (an echten Leerzeichen bzw. grossen Abständen)
     let mut words = Vec::new();
     for mut row in rows {
-        row.sort_by(|a, b| a.x0.partial_cmp(&b.x0).unwrap_or(std::cmp::Ordering::Equal));
+        row.sort_by(|a, b| a.x0.total_cmp(&b.x0));
         let mut current: Vec<&CharInfo> = Vec::new();
         for ch in row.iter() {
             if ch.text.chars().all(|c| c.is_whitespace()) {
@@ -272,7 +271,7 @@ fn add_segment(x0: f32, y0: f32, x1: f32, y1: f32, hsegs: &mut Vec<HSeg>, vsegs:
 }
 
 fn merge_h(segs: &mut Vec<HSeg>) -> Vec<HSeg> {
-    segs.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
+    segs.sort_by(|a, b| a.y.total_cmp(&b.y));
     let mut out: Vec<HSeg> = Vec::new();
     for s in segs.iter() {
         let mut merged = false;
@@ -292,7 +291,7 @@ fn merge_h(segs: &mut Vec<HSeg>) -> Vec<HSeg> {
 }
 
 fn merge_v(segs: &mut Vec<VSeg>) -> Vec<VSeg> {
-    segs.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+    segs.sort_by(|a, b| a.x.total_cmp(&b.x));
     let mut out: Vec<VSeg> = Vec::new();
     for s in segs.iter() {
         let mut merged = false;

@@ -1,5 +1,5 @@
 //! Grafische Oberfläche: Dateien per Drag & Drop sammeln, auswerten, Tabelle prüfen,
-//! als CSV exportieren sowie interaktives Anlernen neuer Vorlagen (Teach-In).
+//! als Excel exportieren sowie interaktives Anlernen neuer Vorlagen (Teach-In).
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -302,8 +302,8 @@ impl DrawGrabApp {
                         for (key, value) in values {
                             match key.as_str() {
                                 "zeichnung" => row.nummer = value,
-                                "bezeichnung" => row.bezeichnung = value,
-                                "material" => row.material = value,
+                                "bezeichnung" => row.bezeichnung = crate::extract::normalize_designation(&value),
+                                "material" => row.material = crate::extract::normalize_material(&value),
                                 "oberflaeche" => row.oberflaeche = value,
                                 _ => {}
                             }
@@ -386,51 +386,72 @@ impl DrawGrabApp {
         processed
     }
 
-    fn export_csv(&mut self) {
+    /// Exportiert die Ergebnisliste als Excel-Datei (.xlsx).
+    fn export_excel(&mut self) -> Result<(), String> {
         let Some(path) = rfd::FileDialog::new()
-            .set_title("CSV exportieren")
-            .add_filter("CSV-Datei", &["csv"])
-            .set_file_name("zeichnungen.csv")
+            .set_title("Excel exportieren")
+            .add_filter("Excel-Datei", &["xlsx"])
+            .set_file_name("zeichnungen.xlsx")
             .save_file()
         else {
-            return;
+            return Ok(());
         };
 
-        let mut buffer = csv::WriterBuilder::new()
-            .delimiter(b';')
-            .from_writer(Vec::new());
+        let mut workbook = rust_xlsxwriter::Workbook::new();
+        let worksheet = workbook
+            .add_worksheet()
+            .set_name("Zeichnungen")
+            .map_err(|e| format!("Excel-Workbook konnte nicht erstellt werden: {e}"))?;
 
-        let _ = buffer.write_record([
-            "Datei",
-            "Zeichnungsnummer",
-            "Bezeichnung",
+        // Spaltenstruktur entspricht der Lieferantenfanfrage (VK-Import-Master).
+        let headers: [&str; 12] = [
+            "Positionsnummer",
+            "Menge",
+            "Hersteller Typennummer",
+            "CAD Revision",
+            "Produkttext kurz (DE)",
             "Material",
-            "Oberflächenbehandlung",
-        ]);
-        for row in &self.rows {
-            let _ = buffer.write_record([
-                row.file_name.as_str(),
-                row.nummer.as_str(),
-                row.bezeichnung.as_str(),
-                row.material.as_str(),
-                row.oberflaeche.as_str(),
-            ]);
+            "Rohabmessungen",
+            "Abmessungen",
+            "Oberfläche",
+            "Bemerkung (DE)",
+            "Produktnummer",
+            "Referenz",
+        ];
+        for (col, header) in headers.iter().enumerate() {
+            worksheet
+                .write_string(0, col as u16, *header)
+                .map_err(|e| format!("Excel konnte nicht geschrieben werden: {e}"))?;
         }
-        let bytes = buffer.into_inner().unwrap_or_default();
 
-        // Byte Order Mark, damit Excel die Umlaute richtig erkennt
-        let write_result = (|| -> std::io::Result<()> {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&path)?;
-            file.write_all(&[0xEF, 0xBB, 0xBF])?;
-            file.write_all(&bytes)?;
-            file.flush()
-        })();
-
-        match write_result {
-            Ok(_) => self.status_text = format!("CSV exportiert: {}", path.display()),
-            Err(e) => self.status_text = format!("CSV konnte nicht gespeichert werden: {e}"),
+        for (pos, row) in self.rows.iter().enumerate() {
+            let row_idx = (pos + 1) as u32;
+            let material = crate::extract::normalize_material(&row.material);
+            let record: Vec<String> = vec![
+                (pos + 1).to_string(), // Positionsnummer – fortlaufend
+                "0".to_string(),       // Menge
+                row.nummer.clone(),    // Hersteller Typennummer
+                String::new(),          // CAD Revision
+                crate::extract::normalize_designation(&row.bezeichnung), // Produkttext kurz (DE)
+                material,               // Material (nur Werkstoffnummer)
+                String::new(),          // Rohabmessungen
+                String::new(),          // Abmessungen
+                row.oberflaeche.clone(), // Oberfläche
+                String::new(),          // Bemerkung (DE)
+                String::new(),          // Produktnummer
+                String::new(),          // Referenz
+            ];
+            worksheet
+                .write_row(row_idx, 0, record)
+                .map_err(|e| format!("Excel konnte nicht geschrieben werden: {e}"))?;
         }
+
+        workbook
+            .save(&path)
+            .map_err(|e| format!("Excel Datei konnte nicht gespeichert werden: {e}"))?;
+
+        self.status_text = format!("Excel exportiert: {}", path.display());
+        Ok(())
     }
 
     /// Zeigt den Teach-In-Dialog zum interaktiven Anlernen neuer Vorlagen.
@@ -1046,9 +1067,11 @@ impl eframe::App for DrawGrabApp {
                 ui.separator();
 
                 let button =
-                    egui::Button::new("⬇ CSV exportieren").min_size(egui::vec2(150.0, 30.0));
+                    egui::Button::new("⬇ Excel exportieren").min_size(egui::vec2(150.0, 30.0));
                 if ui.add_enabled(!self.rows.is_empty(), button).clicked() {
-                    self.export_csv();
+                    if let Err(e) = self.export_excel() {
+                        self.status_text = format!("Excel konnte nicht gespeichert werden: {e}");
+                    }
                 }
                 if !self.rows.is_empty() {
                     if ui.button("🗑 Liste leeren").clicked() {

@@ -1,7 +1,7 @@
 //! DrawGrab – Schriftfelder technischer Zeichnungen (PDF) auslesen.
 //!
 //! Bedienung: PDF-Dateien (oder ganze Ordner) in das Fenster ziehen, "Alle auswerten"
-//! drücken, die Tabelle prüfen und als CSV exportieren.
+//! drücken, die Tabelle prüfen und als Excel exportieren.
 
 mod app;
 mod backend;

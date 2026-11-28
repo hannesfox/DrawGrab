@@ -169,9 +169,9 @@ pub fn extract_field_text(page: &PageData, rect: &NormalizedRect) -> String {
         let y_diff = (a.y0 - b.y0).abs();
         let line_height = (a.size.max(b.size) * 0.5).max(3.5);
         if y_diff < line_height {
-            a.x0.partial_cmp(&b.x0).unwrap_or(std::cmp::Ordering::Equal)
+            a.x0.total_cmp(&b.x0)
         } else {
-            a.y0.partial_cmp(&b.y0).unwrap_or(std::cmp::Ordering::Equal)
+            a.y0.total_cmp(&b.y0)
         }
     });
 

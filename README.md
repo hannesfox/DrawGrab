@@ -1,8 +1,8 @@
 # DrawGrab 📐
 
-> **Automatisierte Schriftfeld-Erkennung für technische Zeichnungen (PDF) mit interaktivem Teach-In und CSV-Export.**
+> **Automatisierte Schriftfeld-Erkennung für technische Zeichnungen (PDF) mit interaktivem Teach-In und Excel-Export.**
 
-DrawGrab liest automatisch relevante Metadaten aus den Schriftfeldern technischer Zeichnungen (PDF-Format) aus, stellt sie in einer interaktiven Tabelle übersichtlich dar und ermöglicht den direkten Export als Excel-kompatible CSV-Datei. Über den integrierten **visuellen Teach-In-Modus** können beliebig viele unterschiedliche Zeichnungslayouts intuitiv per Mausklick angelernt werden.
+DrawGrab liest automatisch relevante Metadaten aus den Schriftfeldern technischer Zeichnungen (PDF-Format) aus, stellt sie in einer interaktiven Tabelle übersichtlich dar und ermöglicht den direkten Export als Excel-Datei (.xlsx). Über den integrierten **visuellen Teach-In-Modus** können beliebig viele unterschiedliche Zeichnungslayouts intuitiv per Mausklick angelernt werden.
 
 ---
 
@@ -25,9 +25,10 @@ DrawGrab liest automatisch relevante Metadaten aus den Schriftfeldern technische
   - **Direkte Nachbearbeitung:** Alle Werte können vor dem Export direkt in der Tabelle korrigiert oder ergänzt werden.
   - **Detail-Tooltips:** Hover über Zellen zeigt vollständige Dateipfade, lange Texte und Statusmeldungen im Volltext.
   - **Spaltenbreiten-Reset:** Ein Klick auf `⟲ Spaltenbreiten` stellt die optimierten Standardbreiten wieder her.
-- **Excel-optimierter CSV-Export:**
-  - Export mit Semikolon (`;`) als Trennzeichen.
-  - Automatisches UTF-8 BOM, damit Umlaute und Sonderzeichen direkt in Microsoft Excel korrekt geöffnet werden.
+- **Excel-Export:**
+  - Export als modernes Excel-Format (.xlsx) mit allen relevanten Spalten (Positionsnummer, Menge, Hersteller Typennummer, CAD Revision, Produkttext kurz (DE), Material, Oberfläche usw.).
+  - Materialangaben werden auf die reine Werkstoffnummer reduziert (z. B. „16 MnCr5 / 1.7131“ → „1.7131“).
+  - Die Mengenangabe wird in der Liste immer als `0` geführt.
 - **Integrierte PDFium-Engine:**
   - Schnelles und präzises Auslesen von Texten und Vektorelementen ohne externe Abhängigkeiten (PDFium wird beim Build automatisch plattformspezifisch eingebettet).
 - **Zwei Betriebsmodi:**
@@ -66,7 +67,7 @@ cargo run --release
 3. **Auswerten & Exportieren:**
    - Auf **`▶ Alle auswerten`** klicken.
    - Werte in der Tabelle prüfen und ggf. direkt anpassen.
-   - Mit **`⬇ CSV exportieren`** als `.csv` speichern.
+   - Mit **`⬇ Excel exportieren`** als `.xlsx` speichern.
 
 ### 2. Neue Zeichnungsvorlage anlernen (Teach-In)
 1. In der Werkzeugleiste auf **`🎓 Vorlage anlernen …`** klicken.
@@ -104,7 +105,7 @@ cargo run --release -- --debug /Pfad/zu/zeichnung.pdf
 - **PDF-Rendering & Textextraktion:** [pdfium-render](https://crates.io/crates/pdfium-render) (Google PDFium)
 - **Serialisierung:** [serde](https://crates.io/crates/serde) & [serde_json](https://crates.io/crates/serde_json)
 - **Dateidialoge:** [rfd](https://crates.io/crates/rfd) (Native File Dialogs)
-- **CSV-Generierung:** [csv](https://crates.io/crates/csv)
+- **Excel-Generierung:** [rust_xlsxwriter](https://crates.io/crates/rust_xlsxwriter)
 
 ---
 

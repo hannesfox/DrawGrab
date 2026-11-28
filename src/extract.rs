@@ -152,6 +152,95 @@ pub fn decode_page(page: &PageData) -> PageData {
     }
 }
 
+/// Normalisiert einen Materialwert für die Auswertungsliste.
+///
+/// Aus Angaben wie „16 MnCr5 / 1.7131 / einsatzhaerten / CASE HARDENED“ wird
+/// nur die reine Werkstoffnummer übernommen, z. B. „1.7131".
+pub fn normalize_material(raw: &str) -> String {
+    let cleaned = clean_material_text(raw);
+    if cleaned.is_empty() {
+        return cleaned;
+    }
+
+    // Mit „ / “ getrennte Segmente: Den Segment, der die Werkstoffnummer trägt, übernehmen.
+    let segments: Vec<&str> = cleaned.split('/').map(str::trim).filter(|s| !s.is_empty()).collect();
+    for segment in segments {
+        if let Some(number) = find_material_number(segment) {
+            return number;
+        }
+    }
+
+    // Ohne „ / “ reicht die reine Zahlenkennung (z. B. „1.0037 S235JR“ -> „1.0037“).
+    find_material_number(&cleaned).unwrap_or(cleaned)
+}
+
+/// Normaliert einen Bezeichnungswert: Deutsche Angabe bevorzugen, englische
+/// Übersetzung ignorieren (übernehmen, falls keine deutsche vorhanden ist).
+///
+/// Beispiel: „DRUCKBOLZEN / PRESSURE BOLT“ -> „DRUCKBOLZEN“.
+pub fn normalize_designation(raw: &str) -> String {
+    let cleaned = clean_material_text(raw);
+    if cleaned.is_empty() {
+        return cleaned;
+    }
+    let parts: Vec<&str> = cleaned.split('/').map(str::trim).filter(|s| !s.is_empty()).collect();
+    if parts.len() <= 1 {
+        cleaned
+    } else {
+        parts[0].to_string()
+    }
+}
+
+/// Bereinigt einen Materialtext (Trimmen, mehrfaches Leerzeichen zusammenfassen).
+fn clean_material_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut last_was_space = false;
+    for c in raw.trim().chars() {
+        if c.is_whitespace() {
+            if !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            out.push(c);
+            last_was_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Sucht die erste Werkstoffnummer (Zahlen mit Punkt, z. B. „1.7131“) im Text.
+fn find_material_number(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        if chars[i].is_ascii_digit() {
+            let start = i;
+            while i < len && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            // Zahlen mit Dezimalpunkt erkennen, z. B. "1.7131"
+            if i + 1 < len && chars[i] == '.' && chars[i + 1].is_ascii_digit() {
+                let number_start = start;
+                let mut end = i + 1;
+                while end < len && chars[end].is_ascii_digit() {
+                    end += 1;
+                }
+                let before_ok = start == 0 || !chars[start - 1].is_ascii_alphanumeric();
+                let after_ok = end >= len || !chars[end].is_ascii_alphanumeric();
+                if before_ok && after_ok {
+                    let number: String = chars[number_start..end].iter().collect();
+                    return Some(number);
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Liest alle Felder einer PDF-Datei aus.
 pub fn extract(pages: &[PageData]) -> Extraction {
     let mut best: Option<Vec<(String, String)>> = None;
@@ -274,7 +363,7 @@ fn extract_page(page: &PageData) -> Vec<(String, String)> {
             cluster.words[c.end].y1 - cluster.words[c.start].y0
         })
         .collect();
-    sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sizes.sort_by(|a, b| a.total_cmp(b));
     let label_size = sizes.get(sizes.len() / 2).copied().unwrap_or(10.0);
     let band = 3.0 * label_size.max(4.0);
 
@@ -329,13 +418,11 @@ fn extract_page(page: &PageData) -> Vec<(String, String)> {
             items.sort_by(|a, b| {
                 clusters[*a]
                     .y0
-                    .partial_cmp(&clusters[*b].y0)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .total_cmp(&clusters[*b].y0)
                     .then_with(|| {
                         clusters[*a]
                             .x0
-                            .partial_cmp(&clusters[*b].x0)
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .total_cmp(&clusters[*b].x0)
                     })
             });
 
@@ -492,9 +579,8 @@ fn cluster_words(words: &[Word]) -> Vec<Cluster> {
     let mut indexed: Vec<(usize, &Word)> = words.iter().enumerate().collect();
     indexed.sort_by(|a, b| {
         a.1.baseline
-            .partial_cmp(&b.1.baseline)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.x0.partial_cmp(&b.1.x0).unwrap_or(std::cmp::Ordering::Equal))
+            .total_cmp(&b.1.baseline)
+            .then_with(|| a.1.x0.total_cmp(&b.1.x0))
     });
 
     let mut rows: Vec<Vec<(usize, &Word)>> = Vec::new();
@@ -509,7 +595,7 @@ fn cluster_words(words: &[Word]) -> Vec<Cluster> {
     // Innerhalb einer Zeile an großen Abständen trennen
     let mut clusters = Vec::new();
     for mut row in rows {
-        row.sort_by(|a, b| a.1.x0.partial_cmp(&b.1.x0).unwrap_or(std::cmp::Ordering::Equal));
+        row.sort_by(|a, b| a.1.x0.total_cmp(&b.1.x0));
         let mut current: Vec<Word> = Vec::new();
         for (_, w) in row {
             if let Some(prev) = current.last() {
@@ -531,7 +617,7 @@ fn cluster_words(words: &[Word]) -> Vec<Cluster> {
 /// Entfernt Glyphenstriche (Schreibschrift) aus der Linienerkennung.
 fn build_grid(page: &PageData, clusters: &[Cluster]) -> (Vec<HSeg>, Vec<VSeg>) {
     let mut sizes: Vec<f32> = clusters.iter().map(|c| c.size).filter(|s| *s > 0.0).collect();
-    sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sizes.sort_by(|a, b| a.total_cmp(b));
     let median = sizes.get(sizes.len() / 2).copied().unwrap_or(8.0);
     let min_len = (10.0f32).max(2.2 * median);
 
@@ -645,9 +731,8 @@ pub fn debug_dump(page: &PageData) {
     if std::env::var_os("DRAWGRAB_WORDS").is_some() {
         let mut words: Vec<&Word> = page.words.iter().collect();
         words.sort_by(|a, b| a.baseline
-            .partial_cmp(&b.baseline)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.x0.partial_cmp(&b.x0).unwrap_or(std::cmp::Ordering::Equal)));
+            .total_cmp(&b.baseline)
+            .then_with(|| a.x0.total_cmp(&b.x0)));
         let mut last_baseline = f32::NAN;
         let mut prev_x1 = f32::NAN;
         for w in words {
@@ -670,7 +755,7 @@ pub fn debug_dump(page: &PageData) {
     println!("== Seite {:.0} x {:.0}, {} Wörter, {} Cluster", page.width, page.height, page.words.len(), clusters.len());
     println!("== Raster: {} waagerecht, {} senkrecht", hsegs.len(), vsegs.len());
     let mut visible: Vec<&Cluster> = clusters.iter().collect();
-    visible.sort_by(|a, b| a.y0.partial_cmp(&b.y0).unwrap_or(std::cmp::Ordering::Equal));
+    visible.sort_by(|a, b| a.y0.total_cmp(&b.y0));
     for c in visible {
         if c.x0 < page.width * 0.45 {
             continue;
@@ -688,5 +773,48 @@ pub fn debug_dump(page: &PageData) {
     let values = extract_page(&decoded);
     for (key, value) in values {
         println!("FELD(decodiert) {key} = {value:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_material() {
+        // Vollstaendige Angabe mit Werkstoffnummer -> nur die Nummer
+        assert_eq!(normalize_material("16 MnCr5 / 1.7131"), "1.7131");
+        assert_eq!(normalize_material("16 MnCr 5 / 1.7131"), "1.7131");
+        assert_eq!(
+            normalize_material("16 MnCr 5 / 1.7131 / einsatzhaerten / CASE HARDENED"),
+            "1.7131"
+        );
+        assert_eq!(normalize_material("Ck 45 / 1.1191 / badnitriert / BATH NITRIDED"), "1.1191");
+        assert_eq!(normalize_material("42 CrMo 4 / 1.7225 / gasnitriert / GAS NITRIDED"), "1.7225");
+        assert_eq!(normalize_material("AlCuBiPb / 3.1655"), "3.1655");
+        assert_eq!(normalize_material("AlMgSi 0, 5 / 3.3206"), "3.3206");
+        assert_eq!(normalize_material("X 5 CrNi 18 10 / 1.4301"), "1.4301");
+        // Reine Zahlenkennung ohne weitere Angabe
+        assert_eq!(normalize_material("1.0037 S235JR"), "1.0037");
+    }
+
+    #[test]
+    fn test_normalize_material_keep_plain_values() {
+        assert_eq!(normalize_material("PA6 black PA6 schwarz"), "PA6 black PA6 schwarz");
+        assert_eq!(normalize_material("Aluminium-Flachmaterial"), "Aluminium-Flachmaterial");
+        assert_eq!(normalize_material("Material <nicht festgelegt>"), "Material <nicht festgelegt>");
+        assert_eq!(normalize_material(""), "");
+    }
+
+    #[test]
+    fn test_normalize_designation() {
+        // Deutsche Angabe zuerst, englische Uebersetzung ignorieren
+        assert_eq!(normalize_designation("DRUCKBOLZEN / PRESSURE BOLT"), "DRUCKBOLZEN");
+        assert_eq!(normalize_designation("FUEHRUNG / GUIDEWAY"), "FUEHRUNG");
+        assert_eq!(normalize_designation("RUNDFEDER / ROUND SPRING"), "RUNDFEDER");
+        assert_eq!(normalize_designation("ANSCHLUSSPLATTE / CONNECTING PLATE"), "ANSCHLUSSPLATTE");
+        // Reine englische Angabe ohne deutsche Alternative -> englisch uebernehmen
+        assert_eq!(normalize_designation("PRESSURE BOLT"), "PRESSURE BOLT");
+        assert_eq!(normalize_designation("Kunstst. \"S\" gruen"), "Kunstst. \"S\" gruen");
     }
 }
