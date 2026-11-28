@@ -1251,6 +1251,12 @@ impl eframe::App for DrawGrabApp {
         if self.poll_events(ctx) > 0 {
             ctx.request_repaint();
         }
+        // Solange im Hintergrund gerendert/geladen wird, regelmäßig neu zeichnen.
+        // Sonst bleibt die Anzeige nach einer Auswahl in der PDF-Liste stehen, bis
+        // die Maus bewegt wird (egui zeichnet nur bei Eingaben neu).
+        if self.preview.loading || self.teach_in.loading {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1259,6 +1265,11 @@ impl eframe::App for DrawGrabApp {
         // Ereignisse abfragen
         if self.poll_events(&ctx) > 0 {
             ctx.request_repaint();
+        }
+        // Während im Hintergrund geladen/gerendert wird, weiter neu zeichnen,
+        // damit das Ergebnis nicht erst bei der nächsten Mausbewegung erscheint.
+        if self.preview.loading || self.teach_in.loading {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
         // Dateien per Drag & Drop aufnehmen
