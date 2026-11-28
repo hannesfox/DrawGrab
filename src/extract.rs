@@ -152,6 +152,24 @@ pub fn decode_page(page: &PageData) -> PageData {
     }
 }
 
+/// Erkennt, ob eine Seite ohne ToUnicode-CMap vorliegt (roher CID-Text).
+///
+/// Dieselbe Entscheidung wie in [`extract`]: die Variante mit mehr erkannten
+/// Schriftfeldern gewinnt. Bei Gleichstand bleibt die Seite roh, damit
+/// korrekt kodierte PDFs nicht versehentlich "dekodiert" (verschoben) werden.
+pub fn page_uses_cid_encoding(page: &PageData) -> bool {
+    let count = |p: &PageData| {
+        extract_page(p)
+            .iter()
+            .filter(|(_, v)| !v.trim().is_empty())
+            .count()
+    };
+    let raw = count(page);
+    let decoded_page = decode_page(page);
+    let decoded = count(&decoded_page);
+    decoded > raw
+}
+
 /// Normalisiert einen Materialwert für die Auswertungsliste.
 ///
 /// Aus Angaben wie „16 MnCr5 / 1.7131 / einsatzhaerten / CASE HARDENED“ wird

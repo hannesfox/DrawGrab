@@ -131,6 +131,17 @@ fn sanitize_id(s: &str) -> String {
 
 /// Extrahiert und bereinigt den Text innerhalb eines normierten Rechtecks.
 pub fn extract_field_text(page: &PageData, rect: &NormalizedRect) -> String {
+    // Seiten ohne ToUnicode-CMap liefern rohe CIDs (verschobene Zeichen). Für die
+    // Anzeige dieselbe Variante verwenden, die auch `extract` für die Auswertung
+    // wählt – sonst zeigt die Vorschau kryptischen Text, die Tabelle aber nicht.
+    let decoded_page;
+    let cid_decoded = extract::page_uses_cid_encoding(page);
+    let page = if cid_decoded {
+        decoded_page = extract::decode_page(page);
+        &decoded_page
+    } else {
+        page
+    };
     if !page.width.is_finite()
         || !page.height.is_finite()
         || page.width <= 0.0
@@ -194,7 +205,13 @@ pub fn extract_field_text(page: &PageData, rect: &NormalizedRect) -> String {
         .collect::<Vec<_>>()
         .join(" ");
 
-    clean_text(&raw_text)
+    if cid_decoded {
+        // Bereits dekodiert: die CID-Sonderzeichen-Tabelle nicht erneut anwenden
+        // (sie würde z. B. ein echtes 'h' in 'Ü' verwandeln).
+        tidy_text(&raw_text)
+    } else {
+        clean_text(&raw_text)
+    }
 }
 
 /// Sortiert Wörter in natürlicher Leserichtung: Zeilen von oben nach unten,
@@ -246,29 +263,24 @@ fn sort_reading_order(words: &mut Vec<&Word>) {
     *words = out;
 }
 
-/// Säubert den extrahierten Text (Leerzeichen, CID-Sonderzeichen, führende Trennzeichen).
+/// Säubert den extrahierten Text (Leerzeichen, führende Trennzeichen).
+///
+/// Die CID-Sonderzeichen (ä, ö, ü …) werden **nicht** hier übersetzt: Das
+/// geschah früher pauschal über Zeichencodes (104 → 'Ü', 108 → 'ä', …) und
+/// zerstörte korrekt kodierte PDFs (jedes echte 'h' wurde zu 'Ü', jedes 'l'
+/// zu 'ä'). Die CID-Dekodierung passiert nur noch in `extract::decode_page`,
+/// wenn `extract::page_uses_cid_encoding` die Seite als CID-kodiert erkennt.
 pub fn clean_text(raw: &str) -> String {
-    let mut s = raw.trim().to_string();
-    if s.is_empty() {
-        return s;
-    }
+    tidy_text(raw)
+}
 
-    // CID-Dekodierung für PDFs ohne Unicode-CMap anwenden
-    s = s
-        .chars()
-        .map(|c| match c as u32 {
-            104 => 'Ü',
-            108 => 'ä',
-            124 => 'ö',
-            129 => 'ü',
-            131 => '°',
-            137 => 'ß',
-            147 => '±',
-            161 => 'ø',
-            240 => '×',
-            _ => c,
-        })
-        .collect();
+/// Bereinigt bereits dekodierten Text: Leerzeichen vereinheitlichen und
+/// führende Label-Präfixe entfernen (ohne CID-Sonderzeichen-Tabelle).
+fn tidy_text(raw: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() {
+        return String::new();
+    }
 
     // Mehrfache Leerzeichen zusammenfassen
     let mut clean = String::with_capacity(s.len());
@@ -342,6 +354,16 @@ pub fn found_regions(
     templates: &[Template],
     template_id: Option<&str>,
 ) -> Vec<FoundRegion> {
+    // Bei CID-kodierten Seiten einmal dekodieren, damit Vorlagen-Rechtecke und
+    // die Wertsuche (`locate_value`) auf denselben Wörtern arbeiten wie die
+    // Auswertung – sonst bleiben Rahmen/Badges kryptisch.
+    let decoded_page;
+    let page = if extract::page_uses_cid_encoding(page) {
+        decoded_page = extract::decode_page(page);
+        &decoded_page
+    } else {
+        page
+    };
     let tmpl = applied_template(page, templates, template_id);
     let extraction = extract_with_mode(std::slice::from_ref(page), templates, template_id);
     let mut out: Vec<FoundRegion> = Vec::new();
@@ -790,6 +812,49 @@ mod tests {
     }
 
     #[test]
+    fn test_clean_text_keeps_real_letters() {
+        // Korrekt kodierte PDFs: 'h'/'l' dürfen nicht mehr zu 'Ü'/'ä' werden.
+        assert_eq!(clean_text("technische Länge"), "technische Länge");
+        assert_eq!(clean_text("Halbzeug"), "Halbzeug");
+        // Label-Präfixe entfernen und Leerzeichen zusammenfassen bleibt erhalten.
+        assert_eq!(clean_text("Material:   16 MnCr 5"), "16 MnCr 5");
+    }
+
+    #[test]
+    fn test_cid_detection_on_samples() {
+        let pdfium = match crate::pdfium_loader::load_pdfium() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let load = |f: &str| {
+            let path = std::path::Path::new(f);
+            if !path.exists() {
+                return None;
+            }
+            crate::backend::render_page_preview(&pdfium, path, 0, 600)
+                .ok()
+                .map(|(_, _, _, p)| p)
+        };
+
+        // Seite ohne ToUnicode-CMap: muss erkannt und lesbar dekodiert werden.
+        if let Some(p) = load("Samples/T260509.pdf") {
+            assert!(extract::page_uses_cid_encoding(&p), "CID-Seite erkannt");
+            let txt = extract_field_text(&p, &NormalizedRect::new(0.0, 0.0, 1.0, 1.0));
+            assert!(txt.contains("Oberflächenbehandlung"), "dekodiert: {txt}");
+        }
+
+        // Korrekt kodierte Seite: bleibt roh, Text darf nicht verschoben werden.
+        if let Some(p) = load("Samples/e232174.pdf") {
+            assert!(
+                !extract::page_uses_cid_encoding(&p),
+                "korrekte Seite bleibt roh"
+            );
+            let txt = extract_field_text(&p, &NormalizedRect::new(0.0, 0.0, 1.0, 1.0));
+            assert!(txt.contains("technischen"), "unverfälscht: {txt}");
+        }
+    }
+
+    #[test]
     fn test_render_sample_preview() {
         let pdfium = match crate::pdfium_loader::load_pdfium() {
             Ok(p) => p,
@@ -870,3 +935,4 @@ mod tests {
         assert_eq!(loaded[0].name, "TestVorlage");
     }
 }
+
