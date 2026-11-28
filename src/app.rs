@@ -223,6 +223,8 @@ struct DrawGrabApp {
     teach_in: TeachInState,
     tab: Tab,
     preview: PreviewState,
+    /// Noch ausstehende Auswertungs-Ergebnisse (für Repaint während der Arbeit).
+    pending: usize,
 }
 
 impl DrawGrabApp {
@@ -303,6 +305,7 @@ impl DrawGrabApp {
             teach_in: TeachInState::default(),
             tab: Tab::Auswertung,
             preview: PreviewState::default(),
+            pending: 0,
         }
     }
 
@@ -356,6 +359,7 @@ impl DrawGrabApp {
                     .map(|t| format!("Vorlage „{}“", t.name))
                     .unwrap_or_else(|| "Vorlage".to_string()),
             };
+            self.pending = self.pending.saturating_add(count);
             self.status_text = format!("{count} Datei(en) werden ausgewertet ({tmpl_info}) …");
         }
     }
@@ -366,6 +370,7 @@ impl DrawGrabApp {
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 Event::Done(path, values, missing) => {
+                    self.pending = self.pending.saturating_sub(1);
                     if let Some(row) = self.rows.iter_mut().find(|r| r.path == path) {
                         for (key, value) in values {
                             match key.as_str() {
@@ -389,6 +394,7 @@ impl DrawGrabApp {
                     processed += 1;
                 }
                 Event::Failed(path, message) => {
+                    self.pending = self.pending.saturating_sub(1);
                     if let Some(row) = self.rows.iter_mut().find(|r| r.path == path) {
                         row.status = Status::Fehler(message);
                     }
@@ -1254,7 +1260,7 @@ impl eframe::App for DrawGrabApp {
         // Solange im Hintergrund gerendert/geladen wird, regelmäßig neu zeichnen.
         // Sonst bleibt die Anzeige nach einer Auswahl in der PDF-Liste stehen, bis
         // die Maus bewegt wird (egui zeichnet nur bei Eingaben neu).
-        if self.preview.loading || self.teach_in.loading {
+        if self.pending > 0 || self.preview.loading || self.teach_in.loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
@@ -1268,7 +1274,7 @@ impl eframe::App for DrawGrabApp {
         }
         // Während im Hintergrund geladen/gerendert wird, weiter neu zeichnen,
         // damit das Ergebnis nicht erst bei der nächsten Mausbewegung erscheint.
-        if self.preview.loading || self.teach_in.loading {
+        if self.pending > 0 || self.preview.loading || self.teach_in.loading {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
 
