@@ -1411,15 +1411,6 @@ impl eframe::App for DrawGrabApp {
                         }
                     });
 
-                // Button für Teach-In Modus
-                if ui
-                    .button(egui::RichText::new("🎓 Vorlage anlernen …").strong())
-                    .on_hover_text("Interaktives Anlernen eines neuen Schriftfeld-Layouts per Mausauswahl (öffnet den Reiter)")
-                    .clicked()
-                {
-                    self.tab = Tab::VorlageAnlernen;
-                }
-
                 ui.separator();
 
                 let auswertbar = !self.neu.is_empty();
