@@ -48,12 +48,66 @@ impl Row {
 enum Command {
     Process(Vec<PathBuf>, Option<String>, Vec<Template>),
     RenderPreview(PathBuf),
+    /// PDF-Vorschau-Tab: Seite rendern + erkannte Bereiche bestimmen.
+    RenderPdfVorschau(PathBuf, i32),
 }
 
 enum Event {
     Done(PathBuf, Vec<(String, String)>, Vec<String>),
     Failed(PathBuf, String),
-    PreviewReady(PathBuf, Result<(u32, u32, Vec<u8>, backend::PageData), String>),
+    PreviewReady(
+        PathBuf,
+        Result<(u32, u32, Vec<u8>, backend::PageData), String>,
+    ),
+    PdfVorschauReady(
+        PathBuf,
+        Result<(u32, u32, Vec<u8>, backend::PageData), String>,
+    ),
+}
+
+/// Ausgewählter Reiter der Oberfläche.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    /// Seite 1: PDFs reinziehen, auswerten, Ergebnisse, Excel.
+    Auswertung,
+    /// PDF ansehen + gefundene Bereiche eingerahmt.
+    PdfVorschau,
+    /// Neue Vorlage anlernen (Teach-In).
+    VorlageAnlernen,
+}
+
+/// Zustand des PDF-Vorschau-Tabs.
+struct PreviewState {
+    pdf_path: Option<PathBuf>,
+    page_index: i32,
+    texture: Option<egui::TextureHandle>,
+    page_data: Option<backend::PageData>,
+    image_width: f32,
+    image_height: f32,
+    loading: bool,
+    status_msg: String,
+    /// Auf der Seite gefundene Bereiche (eingerahmt).
+    regions: Vec<template::FoundRegion>,
+    zoom: f32,
+    pan: egui::Vec2,
+}
+
+impl Default for PreviewState {
+    fn default() -> Self {
+        Self {
+            pdf_path: None,
+            page_index: 0,
+            texture: None,
+            page_data: None,
+            image_width: 800.0,
+            image_height: 600.0,
+            loading: false,
+            status_msg: "PDF wählen, um die gefundenen Bereiche zu sehen.".to_string(),
+            regions: Vec::new(),
+            zoom: 0.55,
+            pan: egui::Vec2::new(20.0, 20.0),
+        }
+    }
 }
 
 pub fn run() {
@@ -83,7 +137,6 @@ struct TeachInField {
 }
 
 struct TeachInState {
-    is_open: bool,
     pdf_path: Option<PathBuf>,
     texture: Option<egui::TextureHandle>,
     page_data: Option<backend::PageData>,
@@ -103,7 +156,6 @@ struct TeachInState {
 impl Default for TeachInState {
     fn default() -> Self {
         Self {
-            is_open: false,
             pdf_path: None,
             texture: None,
             page_data: None,
@@ -162,6 +214,8 @@ struct DrawGrabApp {
     templates: Vec<Template>,
     selected_template_id: Option<String>,
     teach_in: TeachInState,
+    tab: Tab,
+    preview: PreviewState,
 }
 
 impl DrawGrabApp {
@@ -218,6 +272,11 @@ impl DrawGrabApp {
                             let result = backend::render_page_preview(&pdfium, &file, 0, 1600);
                             let _ = tx_event.send(Event::PreviewReady(file, result));
                         }
+                        Command::RenderPdfVorschau(file, page_index) => {
+                            let result =
+                                backend::render_page_preview(&pdfium, &file, page_index, 1600);
+                            let _ = tx_event.send(Event::PdfVorschauReady(file, result));
+                        }
                     }
                 }
             })
@@ -235,6 +294,8 @@ impl DrawGrabApp {
             templates,
             selected_template_id: None,
             teach_in: TeachInState::default(),
+            tab: Tab::Auswertung,
+            preview: PreviewState::default(),
         }
     }
 
@@ -302,8 +363,12 @@ impl DrawGrabApp {
                         for (key, value) in values {
                             match key.as_str() {
                                 "zeichnung" => row.nummer = value,
-                                "bezeichnung" => row.bezeichnung = crate::extract::normalize_designation(&value),
-                                "material" => row.material = crate::extract::normalize_material(&value),
+                                "bezeichnung" => {
+                                    row.bezeichnung = crate::extract::normalize_designation(&value)
+                                }
+                                "material" => {
+                                    row.material = crate::extract::normalize_material(&value)
+                                }
                                 "oberflaeche" => row.oberflaeche = value,
                                 _ => {}
                             }
@@ -356,6 +421,45 @@ impl DrawGrabApp {
                         }
                         Err(e) => {
                             self.teach_in.status_msg = format!("Fehler beim Laden: {e}");
+                        }
+                    }
+                    processed += 1;
+                }
+                Event::PdfVorschauReady(path, result) => {
+                    self.preview.loading = false;
+                    match result {
+                        Ok((w, h, rgba, pdata)) => {
+                            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                [w as usize, h as usize],
+                                &rgba,
+                            );
+                            self.preview.texture = Some(ctx.load_texture(
+                                "pdf_vorschau_preview",
+                                color_image,
+                                egui::TextureOptions::LINEAR,
+                            ));
+                            self.preview.image_width = w as f32;
+                            self.preview.image_height = h as f32;
+                            self.preview.regions = template::found_regions(
+                                &pdata,
+                                &self.templates,
+                                self.selected_template_id.as_deref(),
+                            );
+                            self.preview.page_data = Some(pdata);
+                            self.preview.status_msg = format!(
+                                "Seite {} geladen: {}",
+                                self.preview.page_index + 1,
+                                path.file_name().unwrap_or_default().to_string_lossy()
+                            );
+                        }
+                        Err(e) => {
+                            self.preview.status_msg = format!("Fehler beim Laden: {e}");
+                            self.preview.texture = None;
+                            self.preview.regions.clear();
+                            // Seiten-Überlauf (zu hoher Seitenindex) zurücksetzen
+                            if self.preview.page_index > 0 {
+                                self.preview.page_index -= 1;
+                            }
                         }
                     }
                     processed += 1;
@@ -431,15 +535,15 @@ impl DrawGrabApp {
                 (pos + 1).to_string(), // Positionsnummer – fortlaufend
                 "0".to_string(),       // Menge
                 row.nummer.clone(),    // Hersteller Typennummer
-                String::new(),          // CAD Revision
+                String::new(),         // CAD Revision
                 crate::extract::normalize_designation(&row.bezeichnung), // Produkttext kurz (DE)
-                material,               // Material (nur Werkstoffnummer)
-                String::new(),          // Rohabmessungen
-                String::new(),          // Abmessungen
+                material,              // Material (nur Werkstoffnummer)
+                String::new(),         // Rohabmessungen
+                String::new(),         // Abmessungen
                 row.oberflaeche.clone(), // Oberfläche
-                String::new(),          // Bemerkung (DE)
-                String::new(),          // Produktnummer
-                String::new(),          // Referenz
+                String::new(),         // Bemerkung (DE)
+                String::new(),         // Produktnummer
+                String::new(),         // Referenz
             ];
             worksheet
                 .write_row(row_idx, 0, record)
@@ -455,54 +559,249 @@ impl DrawGrabApp {
     }
 
     /// Zeigt den Teach-In-Dialog zum interaktiven Anlernen neuer Vorlagen.
-    fn show_teach_in_window(&mut self, ctx: &egui::Context) {
-        let mut is_open = self.teach_in.is_open;
-        egui::Window::new("🎓 Teach-In: Zeichnungsvorlage interaktiv anlernen")
-            .open(&mut is_open)
-            .resizable(true)
-            .collapsible(false)
-            .default_size([1320.0, 800.0])
-            .min_size([920.0, 600.0])
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if ui.button("📄 Beispiel-PDF wählen …").clicked() {
-                        if let Some(file) = rfd::FileDialog::new()
-                            .set_title("Beispiel-Zeichnung (PDF) für Vorlage wählen")
-                            .add_filter("Zeichnungen (PDF)", &["pdf"])
-                            .pick_file()
-                        {
-                            self.teach_in.pdf_path = Some(file.clone());
-                            self.teach_in.loading = true;
-                            self.teach_in.status_msg = format!(
-                                "Lade {} …",
-                                file.file_name().unwrap_or_default().to_string_lossy()
-                            );
-                            if self.teach_in.template_name.is_empty() {
-                                self.teach_in.template_name = file
-                                    .file_stem()
-                                    .map(|s| s.to_string_lossy().to_string())
-                                    .unwrap_or_else(|| "Neue Vorlage".to_string());
+    /// Lädt die aktuell gewählte Seite des PDF-Vorschau-Tabs neu.
+    fn request_preview_page(&mut self) {
+        if let Some(path) = self.preview.pdf_path.clone() {
+            self.preview.loading = true;
+            self.preview.regions.clear();
+            let _ = self
+                .tx
+                .send(Command::RenderPdfVorschau(path, self.preview.page_index));
+        }
+    }
+
+    /// Reiter „PDF-Vorschau & erkannte Bereiche": Seite ansehen, gefundene Bereiche eingerahmt.
+    fn tab_pdf_vorschau(&mut self, ui: &mut egui::Ui) {
+        ui.heading("🔍 PDF-Vorschau & erkannte Bereiche");
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            if ui.button("📄 PDF wählen …").clicked() {
+                if let Some(file) = rfd::FileDialog::new()
+                    .add_filter("Zeichnungen (PDF)", &["pdf"])
+                    .pick_file()
+                {
+                    self.preview.pdf_path = Some(file.clone());
+                    self.preview.page_index = 0;
+                    self.preview.loading = true;
+                    self.preview.regions.clear();
+                    let _ = self.tx.send(Command::RenderPdfVorschau(file, 0));
+                }
+            }
+            // PDF aus bereits hinzugefügten Zeichnungen wählen
+            if !self.rows.is_empty() {
+                egui::ComboBox::from_id_salt("vorschau_datei")
+                    .selected_text("aus Liste …")
+                    .show_ui(ui, |ui| {
+                        let paths: Vec<PathBuf> =
+                            self.rows.iter().map(|r| r.path.clone()).collect();
+                        for p in paths {
+                            let name = p
+                                .file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            if ui.selectable_label(false, name).clicked() {
+                                self.preview.pdf_path = Some(p.clone());
+                                self.preview.page_index = 0;
+                                self.preview.loading = true;
+                                self.preview.regions.clear();
+                                let _ = self.tx.send(Command::RenderPdfVorschau(p, 0));
                             }
-                            let _ = self.tx.send(Command::RenderPreview(file));
                         }
-                    }
+                    });
+            }
 
-                    if let Some(ref path) = self.teach_in.pdf_path {
-                        ui.label(format!(
-                            "Geladen: {}",
-                            path.file_name().unwrap_or_default().to_string_lossy()
-                        ));
-                    } else {
-                        ui.label("Keine PDF geladen");
-                    }
+            ui.separator();
 
-                    ui.separator();
-                    ui.label(&self.teach_in.status_msg);
-                });
+            let has = self.preview.pdf_path.is_some();
+            if ui
+                .add_enabled(
+                    has && self.preview.page_index > 0,
+                    egui::Button::new("◀ Seite"),
+                )
+                .clicked()
+            {
+                self.preview.page_index -= 1;
+                self.request_preview_page();
+            }
+            ui.label(format!("Seite {}", self.preview.page_index + 1));
+            if ui.add_enabled(has, egui::Button::new("Seite ▶")).clicked() {
+                self.preview.page_index += 1;
+                self.request_preview_page();
+            }
+
+            ui.separator();
+            if ui.button("➖").clicked() {
+                self.preview.zoom = (self.preview.zoom * 0.85).max(0.15);
+            }
+            if ui.button("100%").clicked() {
+                self.preview.zoom = 0.55;
+            }
+            if ui.button("➕").clicked() {
+                self.preview.zoom = (self.preview.zoom * 1.15).min(6.0);
+            }
+            if ui.button("⟲").clicked() {
+                self.preview.zoom = 0.55;
+                self.preview.pan = egui::Vec2::new(20.0, 20.0);
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(format!("{} Bereich(e) erkannt", self.preview.regions.len()));
+            });
+        });
+
+        ui.label(&self.preview.status_msg);
+        ui.add_space(4.0);
+
+        let canvas_size = ui.available_size();
+        let (response, painter) = ui.allocate_painter(canvas_size, egui::Sense::click_and_drag());
+        let canvas_rect = response.rect;
+
+        // Zoom per Mausrad
+        if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                let factor = if scroll > 0.0 { 1.1 } else { 0.9 };
+                self.preview.zoom = (self.preview.zoom * factor).clamp(0.15, 6.0);
+            }
+        }
+        // Pan per Rechtsklick/Mittelklick
+        let is_panning = ui.input(|i| {
+            i.pointer.button_down(egui::PointerButton::Secondary)
+                || i.pointer.button_down(egui::PointerButton::Middle)
+        });
+        if response.dragged() && is_panning {
+            self.preview.pan += response.drag_delta();
+        }
+
+        let zoom = self.preview.zoom;
+        let pan = self.preview.pan;
+        let img_w = self.preview.image_width * zoom;
+        let img_h = self.preview.image_height * zoom;
+        let img_rect = egui::Rect::from_min_size(canvas_rect.min + pan, egui::vec2(img_w, img_h));
+
+        painter.rect_filled(canvas_rect, 4.0, egui::Color32::from_rgb(28, 30, 34));
+
+        if let Some(ref texture) = self.preview.texture {
+            painter.image(
+                texture.id(),
+                img_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+            painter.rect_stroke(
+                img_rect,
+                0.0,
+                egui::Stroke::new(1.0, egui::Color32::GRAY),
+                egui::StrokeKind::Outside,
+            );
+        } else {
+            let msg = if self.preview.loading {
+                "PDF wird geladen & gerendert …"
+            } else {
+                "Keine PDF geladen – „📄 PDF wählen …\" klicken"
+            };
+            painter.text(
+                canvas_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                msg,
+                egui::FontId::proportional(16.0),
+                egui::Color32::LIGHT_GRAY,
+            );
+        }
+
+        // --- Gefundene Bereiche einrahmen -----------------------------------
+        for region in &self.preview.regions {
+            let color = region_color(&region.key);
+            let min = img_rect.min
+                + egui::vec2(
+                    region.rect.x0 * img_rect.width(),
+                    region.rect.y0 * img_rect.height(),
+                );
+            let max = img_rect.min
+                + egui::vec2(
+                    region.rect.x1 * img_rect.width(),
+                    region.rect.y1 * img_rect.height(),
+                );
+            let r = egui::Rect::from_min_max(min, max);
+            let mut fill = color;
+            fill = egui::Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 45);
+            painter.rect_filled(r, 2.0, fill);
+            painter.rect_stroke(
+                r,
+                2.0,
+                egui::Stroke::new(2.0, color),
+                egui::StrokeKind::Outside,
+            );
+
+            let snippet: String = region.value.chars().take(22).collect();
+            let badge_text = format!("{}: \"{}\"", region.label, snippet);
+            let badge_pos = r.left_top() - egui::vec2(0.0, 18.0);
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    badge_pos,
+                    egui::vec2(badge_text.chars().count() as f32 * 7.0 + 8.0, 18.0),
+                ),
+                3.0,
+                color,
+            );
+            painter.text(
+                badge_pos + egui::vec2(4.0, 2.0),
+                egui::Align2::LEFT_TOP,
+                badge_text,
+                egui::FontId::proportional(11.0),
+                egui::Color32::WHITE,
+            );
+        }
+
+        ui.small("💡 Rechtsklick = Plan verschieben | Mausrad = Zoomen | farbiger Rahmen = erkannter Bereich");
+    }
+
+    /// Reiter „Vorlage anlernen" (Teach-In): neue Vorlage per Mausauswahl anlernen.
+    fn tab_vorlage_anlernen(&mut self, ui: &mut egui::Ui) {
+        ui.heading("🎓 Vorlage anlernen");
+        ui.label("Beispiel-PDF wählen und die zu findenden Bereiche markieren.");
+        ui.add_space(4.0);
+        {
+            ui.horizontal(|ui| {
+                if ui.button("📄 Beispiel-PDF wählen …").clicked() {
+                    if let Some(file) = rfd::FileDialog::new()
+                        .set_title("Beispiel-Zeichnung (PDF) für Vorlage wählen")
+                        .add_filter("Zeichnungen (PDF)", &["pdf"])
+                        .pick_file()
+                    {
+                        self.teach_in.pdf_path = Some(file.clone());
+                        self.teach_in.loading = true;
+                        self.teach_in.status_msg = format!(
+                            "Lade {} …",
+                            file.file_name().unwrap_or_default().to_string_lossy()
+                        );
+                        if self.teach_in.template_name.is_empty() {
+                            self.teach_in.template_name = file
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "Neue Vorlage".to_string());
+                        }
+                        let _ = self.tx.send(Command::RenderPreview(file));
+                    }
+                }
+
+                if let Some(ref path) = self.teach_in.pdf_path {
+                    ui.label(format!(
+                        "Geladen: {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                } else {
+                    ui.label("Keine PDF geladen");
+                }
 
                 ui.separator();
+                ui.label(&self.teach_in.status_msg);
+            });
 
-                ui.columns(2, |columns| {
+            ui.separator();
+
+            ui.columns(2, |columns| {
                     // --- Linke Spalte: Steuerleiste & Felder (360 px) ---
                     let left = &mut columns[0];
                     left.set_max_width(380.0);
@@ -911,8 +1210,7 @@ impl DrawGrabApp {
                         }
                     }
                 });
-            });
-        self.teach_in.is_open = is_open;
+        }
     }
 }
 
@@ -959,7 +1257,26 @@ impl eframe::App for DrawGrabApp {
                 });
             });
 
-        egui::CentralPanel::default().show(ui, |ui| {
+        // --- Reiterleiste ----------------------------------------------------
+        egui::Panel::top("tabs")
+            .resizable(false)
+            .drag_to_open(false)
+            .frame(egui::Frame::default().inner_margin(egui::Margin::symmetric(8, 4)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.tab, Tab::Auswertung, "📋 Auswertung");
+                    ui.selectable_value(
+                        &mut self.tab,
+                        Tab::PdfVorschau,
+                        "🔍 PDF-Vorschau & erkannte Bereiche",
+                    );
+                    ui.selectable_value(&mut self.tab, Tab::VorlageAnlernen, "🎓 Vorlage anlernen");
+                });
+            });
+
+        match self.tab {
+            Tab::Auswertung => {
+                egui::CentralPanel::default().show(ui, |ui| {
             // --- Ablagefläche ------------------------------------------------
             egui::Frame::group(ui.style())
                 .fill(if dragging {
@@ -1049,10 +1366,10 @@ impl eframe::App for DrawGrabApp {
                 // Button für Teach-In Modus
                 if ui
                     .button(egui::RichText::new("🎓 Vorlage anlernen …").strong())
-                    .on_hover_text("Interaktives Anlernen eines neuen Schriftfeld-Layouts per Mausauswahl")
+                    .on_hover_text("Interaktives Anlernen eines neuen Schriftfeld-Layouts per Mausauswahl (öffnet den Reiter)")
                     .clicked()
                 {
-                    self.teach_in.is_open = true;
+                    self.tab = Tab::VorlageAnlernen;
                 }
 
                 ui.separator();
@@ -1230,14 +1547,28 @@ impl eframe::App for DrawGrabApp {
                         });
                 });
 
-            self.rows = rows;
-            self.neu = neu_flag;
-        });
-
-        // Teach-In Dialog anzeigen, wenn geöffnet
-        if self.teach_in.is_open {
-            self.show_teach_in_window(&ctx);
+                    self.rows = rows;
+                    self.neu = neu_flag;
+                });
+            }
+            Tab::PdfVorschau => {
+                egui::CentralPanel::default().show(ui, |ui| self.tab_pdf_vorschau(ui));
+            }
+            Tab::VorlageAnlernen => {
+                egui::CentralPanel::default().show(ui, |ui| self.tab_vorlage_anlernen(ui));
+            }
         }
+    }
+}
+
+/// Farbe je Feld-Schlüssel für die Bereichs-Einrahmung.
+fn region_color(key: &str) -> egui::Color32 {
+    match key {
+        "zeichnung" => egui::Color32::from_rgb(33, 150, 243), // Blau
+        "bezeichnung" => egui::Color32::from_rgb(76, 175, 80), // Grün
+        "material" => egui::Color32::from_rgb(255, 152, 0),   // Orange
+        "oberflaeche" => egui::Color32::from_rgb(156, 39, 176), // Lila
+        _ => egui::Color32::from_rgb(200, 200, 200),
     }
 }
 

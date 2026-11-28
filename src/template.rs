@@ -140,10 +140,7 @@ pub fn extract_field_text(page: &PageData, rect: &NormalizedRect) -> String {
     }
 
     // Rechteck auf endliche Werte prüfen (templates.json kann ungeprüft geladen werden).
-    if !rect.x0.is_finite()
-        || !rect.y0.is_finite()
-        || !rect.x1.is_finite()
-        || !rect.y1.is_finite()
+    if !rect.x0.is_finite() || !rect.y0.is_finite() || !rect.x1.is_finite() || !rect.y1.is_finite()
     {
         return String::new();
     }
@@ -155,7 +152,11 @@ pub fn extract_field_text(page: &PageData, rect: &NormalizedRect) -> String {
 
     // Wörter mit nicht-endlichen Koordinaten ignorieren (sie könnten die Sortierung stören).
     let sane = |w: &&Word| {
-        w.x0.is_finite() && w.y0.is_finite() && w.x1.is_finite() && w.y1.is_finite() && w.size.is_finite()
+        w.x0.is_finite()
+            && w.y0.is_finite()
+            && w.x1.is_finite()
+            && w.y1.is_finite()
+            && w.size.is_finite()
     };
 
     // Zuerst Wörter finden, deren Zentrum in der Box liegt
@@ -209,7 +210,11 @@ pub fn extract_field_text(page: &PageData, rect: &NormalizedRect) -> String {
 fn sort_reading_order(words: &mut Vec<&Word>) {
     // Sicherheit: nicht-endliche Koordinaten ausschließen.
     words.retain(|w| {
-        w.x0.is_finite() && w.y0.is_finite() && w.x1.is_finite() && w.y1.is_finite() && w.size.is_finite()
+        w.x0.is_finite()
+            && w.y0.is_finite()
+            && w.x1.is_finite()
+            && w.y1.is_finite()
+            && w.size.is_finite()
     });
 
     if words.len() < 2 {
@@ -317,6 +322,137 @@ pub fn clean_text(raw: &str) -> String {
 }
 
 /// Extrahiert Felder aus den Seiten unter Berücksichtigung von Vorlagen und Modi.
+/// Ein auf einer Seite gefundenes Feld inkl. Bereich (für Einrahmung in der UI).
+#[derive(Clone, Debug)]
+pub struct FoundRegion {
+    pub key: String,
+    pub label: String,
+    pub value: String,
+    pub rect: NormalizedRect,
+}
+
+/// Liefert die auf einer Seite gefundenen Felder inkl. Bereich.
+///
+/// Nicht invasiv: nutzt die bestehende Extraktion (`extract_with_mode`) und
+/// bestimmt den Bereich (a) aus der angewandten Vorlage (sofern dort Text
+/// steht) oder (b) durch Wiederfinden des Werte-Texts in den Seitenwörtern.
+/// Reine Anzeigehilfe – verändert die Extraktion nicht.
+pub fn found_regions(
+    page: &PageData,
+    templates: &[Template],
+    template_id: Option<&str>,
+) -> Vec<FoundRegion> {
+    let tmpl = applied_template(page, templates, template_id);
+    let extraction = extract_with_mode(std::slice::from_ref(page), templates, template_id);
+    let mut out: Vec<FoundRegion> = Vec::new();
+
+    for (key, value) in &extraction.values {
+        if value.trim().is_empty() {
+            continue;
+        }
+        let template_rect = tmpl
+            .and_then(|t| t.fields.iter().find(|f| &f.key == key))
+            .map(|f| f.rect)
+            .filter(|r| !extract_field_text(page, r).trim().is_empty());
+        let rect = template_rect.or_else(|| locate_value(page, value));
+        if let Some(rect) = rect {
+            out.push(FoundRegion {
+                key: key.clone(),
+                label: field_label(key),
+                value: value.clone(),
+                rect,
+            });
+        }
+    }
+    out
+}
+
+/// Welche Vorlage im (Auto-)Modus auf eine Seite angewandt würde (gleiche Logik wie `extract_with_mode`).
+fn applied_template<'a>(
+    page: &PageData,
+    templates: &'a [Template],
+    template_id: Option<&str>,
+) -> Option<&'a Template> {
+    if let Some(id) = template_id {
+        if id != "none" && id != "auto" {
+            return templates.iter().find(|t| t.id == id);
+        }
+        if id == "none" {
+            return None;
+        }
+    }
+    let mut best: Option<(&Template, usize)> = None;
+    for t in templates {
+        let score = t.match_score(page);
+        if score >= 2 {
+            match best {
+                Some((_, bs)) if score <= bs => {}
+                _ => best = Some((t, score)),
+            }
+        }
+    }
+    best.map(|(t, _)| t)
+}
+
+fn field_label(key: &str) -> String {
+    extract::FIELDS
+        .iter()
+        .find(|f| f.key == key)
+        .map(|f| f.title.to_string())
+        .unwrap_or_else(|| key.to_string())
+}
+
+/// Versucht, einen gefundenen Wert in den Seitenwörtern wiederzufinden und einen
+/// normalisierten Bereich (0..1) dafür zu liefern. Best effort.
+fn locate_value(page: &PageData, value: &str) -> Option<NormalizedRect> {
+    let pw = page.width;
+    let ph = page.height;
+    if !pw.is_finite() || !ph.is_finite() || pw <= 0.0 || ph <= 0.0 {
+        return None;
+    }
+    let needle = norm_token(value);
+    if needle.len() < 2 {
+        return None;
+    }
+    for w in &page.words {
+        if !w.x0.is_finite() || !w.y0.is_finite() || !w.x1.is_finite() || !w.y1.is_finite() {
+            continue;
+        }
+        let t = norm_token(&w.text);
+        if t.is_empty() {
+            continue;
+        }
+        let hit = t == needle || t.contains(&needle) || (needle.contains(&t) && t.len() >= 3);
+        if !hit {
+            continue;
+        }
+        let x0 = (w.x0 / pw).clamp(0.0, 1.0);
+        let y0 = (w.y0 / ph).clamp(0.0, 1.0);
+        let x1 = (w.x1 / pw).clamp(0.0, 1.0);
+        let y1 = (w.y1 / ph).clamp(0.0, 1.0);
+        // etwas Luft rundherum
+        let pad = 0.004_f32;
+        return Some(NormalizedRect::new(
+            (x0 - pad).max(0.0),
+            (y0 - pad).max(0.0),
+            (x1 + pad).min(1.0),
+            (y1 + pad).min(1.0),
+        ));
+    }
+    None
+}
+
+/// Kleinschreibung + nur alphanumerisch; `needle` = erstes sinnvolles Token.
+fn norm_token(s: &str) -> String {
+    s.split_whitespace()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
 pub fn extract_with_mode(
     pages: &[PageData],
     templates: &[Template],
@@ -437,10 +573,15 @@ pub fn templates_path() -> PathBuf {
 fn user_config_templates_path() -> PathBuf {
     if cfg!(windows) {
         if let Some(appdata) = std::env::var_os("APPDATA") {
-            return PathBuf::from(appdata).join("DrawGrab").join("templates.json");
+            return PathBuf::from(appdata)
+                .join("DrawGrab")
+                .join("templates.json");
         }
     } else if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".config").join("drawgrab").join("templates.json");
+        return PathBuf::from(home)
+            .join(".config")
+            .join("drawgrab")
+            .join("templates.json");
     }
     PathBuf::from("templates.json")
 }
@@ -516,6 +657,68 @@ mod tests {
 
         let rect_bez = NormalizedRect::new(0.09, 0.14, 0.22, 0.17);
         assert_eq!(extract_field_text(&page, &rect_bez), "DRUCKBOLZEN");
+    }
+
+    /// `found_regions` nutzt die angewandte Vorlage und liefert eingerahmte Bereiche.
+    #[test]
+    fn test_found_regions_template() {
+        let words = vec![Word {
+            text: "E232174".to_string(),
+            x0: 700.0,
+            y0: 900.0,
+            x1: 800.0,
+            y1: 950.0,
+            size: 14.0,
+            baseline: 935.0,
+        }];
+        let page = PageData {
+            width: 1000.0,
+            height: 1000.0,
+            words,
+            hsegs: vec![],
+            vsegs: vec![],
+        };
+        let mut tmpl = Template::new("T");
+        tmpl.set_field(
+            "zeichnung",
+            "Zeichnungsnummer",
+            NormalizedRect::new(0.7, 0.9, 0.81, 0.96),
+        );
+        let regs = found_regions(&page, &[tmpl.clone()], Some(&tmpl.id));
+        assert_eq!(regs.len(), 1);
+        assert_eq!(regs[0].key, "zeichnung");
+        assert_eq!(regs[0].value, "E232174");
+        assert!(regs[0].rect.width() > 0.0 && regs[0].rect.height() > 0.0);
+        // ohne Vorlage (`none`) -> Heuristik; Bereich wird notfalls per Wiederfinden bestimmt
+        let regs2 = found_regions(&page, &[tmpl], Some("none"));
+        for r in &regs2 {
+            assert!(r.rect.width() > 0.0 && r.rect.height() > 0.0);
+        }
+    }
+
+    /// `locate_value` findet einen Wert im Text und liefert normierten Bereich.
+    #[test]
+    fn test_locate_value() {
+        let words = vec![Word {
+            text: "E232174".to_string(),
+            x0: 500.0,
+            y0: 500.0,
+            x1: 600.0,
+            y1: 520.0,
+            size: 12.0,
+            baseline: 518.0,
+        }];
+        let page = PageData {
+            width: 1000.0,
+            height: 1000.0,
+            words,
+            hsegs: vec![],
+            vsegs: vec![],
+        };
+        let r = locate_value(&page, "E232174").expect("gefunden");
+        assert!((r.x0 - 0.5).abs() < 0.01 && (r.y0 - 0.5).abs() < 0.01);
+        assert!((r.x1 - 0.6).abs() < 0.02 && (r.y1 - 0.52).abs() < 0.02);
+        assert!(locate_value(&page, "NICHTVORHANDEN").is_none());
     }
 
     /// Regression: der frühere paarweise Vergleicher war intransitiv und ließ
@@ -594,7 +797,8 @@ mod tests {
         };
         let sample = std::path::Path::new("Samples/e232174.pdf");
         if sample.exists() {
-            let (w, h, rgba, pdata) = crate::backend::render_page_preview(&pdfium, sample, 0, 1000).unwrap();
+            let (w, h, rgba, pdata) =
+                crate::backend::render_page_preview(&pdfium, sample, 0, 1000).unwrap();
             assert!(w >= 800);
             assert!(h > 0);
             assert_eq!(rgba.len(), (w * h * 4) as usize);
@@ -605,8 +809,16 @@ mod tests {
     #[test]
     fn test_template_save_load_and_mode() {
         let mut tmpl = Template::new("TestVorlage");
-        tmpl.set_field("zeichnung", "Zeichnungsnummer", NormalizedRect::new(0.1, 0.1, 0.2, 0.2));
-        tmpl.set_field("bezeichnung", "Bezeichnung", NormalizedRect::new(0.1, 0.2, 0.3, 0.3));
+        tmpl.set_field(
+            "zeichnung",
+            "Zeichnungsnummer",
+            NormalizedRect::new(0.1, 0.1, 0.2, 0.2),
+        );
+        tmpl.set_field(
+            "bezeichnung",
+            "Bezeichnung",
+            NormalizedRect::new(0.1, 0.2, 0.3, 0.3),
+        );
 
         let words = vec![
             Word {
@@ -639,8 +851,16 @@ mod tests {
         assert_eq!(tmpl.match_score(&page), 2);
 
         let ext = extract_with_mode(&[page], &[tmpl.clone()], Some(&tmpl.id));
-        let num = ext.values.iter().find(|(k, _)| k == "zeichnung").map(|(_, v)| v.as_str());
-        let bez = ext.values.iter().find(|(k, _)| k == "bezeichnung").map(|(_, v)| v.as_str());
+        let num = ext
+            .values
+            .iter()
+            .find(|(k, _)| k == "zeichnung")
+            .map(|(_, v)| v.as_str());
+        let bez = ext
+            .values
+            .iter()
+            .find(|(k, _)| k == "bezeichnung")
+            .map(|(_, v)| v.as_str());
         assert_eq!(num, Some("DWG-999"));
         assert_eq!(bez, Some("FLANSCH"));
 
@@ -649,6 +869,4 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "TestVorlage");
     }
-
 }
-
