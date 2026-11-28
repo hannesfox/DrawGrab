@@ -409,14 +409,9 @@ fn extract_using_template(pages: &[PageData], tmpl: &Template) -> extract::Extra
 
 /// Pfad zur Vorlagendatei `templates.json`.
 pub fn templates_path() -> PathBuf {
-    let local = PathBuf::from("templates.json");
-    if local.exists() {
-        return local;
-    }
-
+    // 1) Fester Ort neben der Binary/dem Bundle. Symlinks auflösen, damit rohe
+    //    Binary und .app-Bundle (Contents/MacOS-Symlink) dasselbe finden.
     if let Ok(exe) = std::env::current_exe() {
-        // Symlinks auflösen, damit rohe Binary und .app-Bundle (Contents/MacOS-Symlink)
-        // dasselbe exe-Verzeichnis (und damit dasselbe templates.json) finden.
         let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
         if let Some(parent) = exe.parent() {
             let p = parent.join("templates.json");
@@ -426,7 +421,28 @@ pub fn templates_path() -> PathBuf {
         }
     }
 
-    local
+    // 2) Fester Nutzer-Config-Ort. NICHT das aktuelle Arbeitsverzeichnis:
+    //    sonst hinge das Verhalten davon ab, aus welchem Ordner man startet
+    //    (z. B. Binary aus `~` lädt ~/templates.json, die .app nicht).
+    let cfg = user_config_templates_path();
+    if cfg.exists() {
+        return cfg;
+    }
+
+    // 3) Schreibziel für `save_templates`: der feste Nutzer-Config-Ort.
+    cfg
+}
+
+/// Fester, vom Arbeitsverzeichnis unabhängiger Pfad für `templates.json`.
+fn user_config_templates_path() -> PathBuf {
+    if cfg!(windows) {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            return PathBuf::from(appdata).join("DrawGrab").join("templates.json");
+        }
+    } else if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".config").join("drawgrab").join("templates.json");
+    }
+    PathBuf::from("templates.json")
 }
 
 /// Lädt alle gespeicherten Vorlagen aus `templates.json`.
@@ -441,6 +457,13 @@ pub fn load_templates() -> Vec<Template> {
 /// Speichert die Vorlagenliste dauerhaft in `templates.json`.
 pub fn save_templates(templates: &[Template]) -> Result<(), String> {
     let path = templates_path();
+    // Zielverzeichnis (z. B. ~/.config/drawgrab) sicherstellen.
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Ordner {} nicht anlegbar: {e}", parent.display()))?;
+        }
+    }
     let json = serde_json::to_string_pretty(templates)
         .map_err(|e| format!("Fehler beim Serialisieren der Vorlagen: {e}"))?;
     fs::write(&path, json).map_err(|e| format!("Fehler beim Schreiben von {}: {e}", path.display()))
@@ -628,3 +651,4 @@ mod tests {
     }
 
 }
+
