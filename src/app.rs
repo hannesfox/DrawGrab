@@ -90,6 +90,8 @@ struct PreviewState {
     regions: Vec<template::FoundRegion>,
     zoom: f32,
     pan: egui::Vec2,
+    /// Zeichnung automatisch an Fenstergröße anpassen.
+    autofit: bool,
 }
 
 impl Default for PreviewState {
@@ -102,10 +104,12 @@ impl Default for PreviewState {
             image_width: 800.0,
             image_height: 600.0,
             loading: false,
-            status_msg: "PDF wählen, um die gefundenen Bereiche zu sehen.".to_string(),
+            status_msg: "Zeichnung links auswählen, um die gefundenen Bereiche zu sehen."
+                .to_string(),
             regions: Vec::new(),
             zoom: 0.55,
             pan: egui::Vec2::new(20.0, 20.0),
+            autofit: true,
         }
     }
 }
@@ -151,6 +155,8 @@ struct TeachInState {
     pan: egui::Vec2,
     status_msg: String,
     loading: bool,
+    /// Angeforderter Einpass-Bereich (wird im Canvas einmalig angewandt).
+    fit_request: Option<NormalizedRect>,
 }
 
 impl Default for TeachInState {
@@ -199,6 +205,7 @@ impl Default for TeachInState {
             pan: egui::Vec2::new(20.0, 20.0),
             status_msg: "Wähle eine Beispiel-PDF-Zeichnung aus, um zu beginnen.".to_string(),
             loading: false,
+            fit_request: None,
         }
     }
 }
@@ -575,44 +582,43 @@ impl DrawGrabApp {
         ui.heading("🔍 PDF-Vorschau & erkannte Bereiche");
         ui.add_space(4.0);
 
-        ui.horizontal(|ui| {
-            if ui.button("📄 PDF wählen …").clicked() {
-                if let Some(file) = rfd::FileDialog::new()
-                    .add_filter("Zeichnungen (PDF)", &["pdf"])
-                    .pick_file()
-                {
-                    self.preview.pdf_path = Some(file.clone());
-                    self.preview.page_index = 0;
-                    self.preview.loading = true;
-                    self.preview.regions.clear();
-                    let _ = self.tx.send(Command::RenderPdfVorschau(file, 0));
-                }
-            }
-            // PDF aus bereits hinzugefügten Zeichnungen wählen
-            if !self.rows.is_empty() {
-                egui::ComboBox::from_id_salt("vorschau_datei")
-                    .selected_text("aus Liste …")
-                    .show_ui(ui, |ui| {
-                        let paths: Vec<PathBuf> =
-                            self.rows.iter().map(|r| r.path.clone()).collect();
-                        for p in paths {
+        // --- Linke Seite: Liste der importierten PDFs -----------------------
+        let sel_path = self.preview.pdf_path.clone();
+        let paths: Vec<PathBuf> = self.rows.iter().map(|r| r.path.clone()).collect();
+        egui::Panel::left("vorschau_liste")
+            .resizable(true)
+            .default_size(240.0)
+            .size_range(140.0..=440.0)
+            .show_inside(ui, |ui| {
+                ui.heading("Zeichnungen");
+                ui.label(format!("{} importiert", paths.len()));
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if paths.is_empty() {
+                            ui.label("Noch keine PDFs. Auf Reiter „📋 Auswertung“ hinzufügen.");
+                        }
+                        for p in &paths {
                             let name = p
                                 .file_name()
                                 .map(|s| s.to_string_lossy().to_string())
                                 .unwrap_or_default();
-                            if ui.selectable_label(false, name).clicked() {
+                            let selected = sel_path.as_deref() == Some(p.as_path());
+                            if ui.selectable_label(selected, name).clicked() && !selected {
                                 self.preview.pdf_path = Some(p.clone());
                                 self.preview.page_index = 0;
                                 self.preview.loading = true;
                                 self.preview.regions.clear();
-                                let _ = self.tx.send(Command::RenderPdfVorschau(p, 0));
+                                self.preview.autofit = true;
+                                let _ = self.tx.send(Command::RenderPdfVorschau(p.clone(), 0));
                             }
                         }
                     });
-            }
+            });
 
-            ui.separator();
-
+        // --- Rechte Seite: Steuerung + Canvas -------------------------------
+        ui.horizontal(|ui| {
             let has = self.preview.pdf_path.is_some();
             if ui
                 .add_enabled(
@@ -632,17 +638,24 @@ impl DrawGrabApp {
 
             ui.separator();
             if ui.button("➖").clicked() {
+                self.preview.autofit = false;
                 self.preview.zoom = (self.preview.zoom * 0.85).max(0.15);
             }
             if ui.button("100%").clicked() {
-                self.preview.zoom = 0.55;
+                self.preview.autofit = false;
+                self.preview.zoom = 1.0;
+                self.preview.pan = egui::Vec2::ZERO;
             }
             if ui.button("➕").clicked() {
-                self.preview.zoom = (self.preview.zoom * 1.15).min(6.0);
+                self.preview.autofit = false;
+                self.preview.zoom = (self.preview.zoom * 1.15).min(8.0);
             }
-            if ui.button("⟲").clicked() {
-                self.preview.zoom = 0.55;
-                self.preview.pan = egui::Vec2::new(20.0, 20.0);
+            if ui
+                .button("⟲ Ansicht einpassen")
+                .on_hover_text("Zeichnung an Fenstergröße anpassen")
+                .clicked()
+            {
+                self.preview.autofit = true;
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -657,12 +670,13 @@ impl DrawGrabApp {
         let (response, painter) = ui.allocate_painter(canvas_size, egui::Sense::click_and_drag());
         let canvas_rect = response.rect;
 
-        // Zoom per Mausrad
+        // Zoom per Mausrad (deaktiviert Auto-Einpassen)
         if response.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll != 0.0 {
                 let factor = if scroll > 0.0 { 1.1 } else { 0.9 };
-                self.preview.zoom = (self.preview.zoom * factor).clamp(0.15, 6.0);
+                self.preview.autofit = false;
+                self.preview.zoom = (self.preview.zoom * factor).clamp(0.15, 8.0);
             }
         }
         // Pan per Rechtsklick/Mittelklick
@@ -671,13 +685,30 @@ impl DrawGrabApp {
                 || i.pointer.button_down(egui::PointerButton::Middle)
         });
         if response.dragged() && is_panning {
+            self.preview.autofit = false;
             self.preview.pan += response.drag_delta();
         }
 
-        let zoom = self.preview.zoom;
-        let pan = self.preview.pan;
-        let img_w = self.preview.image_width * zoom;
-        let img_h = self.preview.image_height * zoom;
+        let nw = self.preview.image_width.max(1.0);
+        let nh = self.preview.image_height.max(1.0);
+        // Zeichnung an Fenstergröße anpassen, solange Auto-Einpassen aktiv ist.
+        let (zoom, pan) = if self.preview.autofit {
+            let (z, pn) = fit_normalized_rect(
+                canvas_rect,
+                nw,
+                nh,
+                NormalizedRect::new(0.0, 0.0, 1.0, 1.0),
+                0.02,
+            );
+            self.preview.zoom = z;
+            self.preview.pan = pn;
+            (z, pn)
+        } else {
+            (self.preview.zoom, self.preview.pan)
+        };
+
+        let img_w = nw * zoom;
+        let img_h = nh * zoom;
         let img_rect = egui::Rect::from_min_size(canvas_rect.min + pan, egui::vec2(img_w, img_h));
 
         painter.rect_filled(canvas_rect, 4.0, egui::Color32::from_rgb(28, 30, 34));
@@ -698,8 +729,10 @@ impl DrawGrabApp {
         } else {
             let msg = if self.preview.loading {
                 "PDF wird geladen & gerendert …"
+            } else if self.preview.pdf_path.is_none() {
+                "Links eine Zeichnung auswählen"
             } else {
-                "Keine PDF geladen – „📄 PDF wählen …\" klicken"
+                "Keine Vorschau"
             };
             painter.text(
                 canvas_rect.center(),
@@ -801,10 +834,12 @@ impl DrawGrabApp {
 
             ui.separator();
 
-            ui.columns(2, |columns| {
-                    // --- Linke Spalte: Steuerleiste & Felder (360 px) ---
-                    let left = &mut columns[0];
-                    left.set_max_width(380.0);
+            egui::Panel::left("teach_in_left")
+                .resizable(true)
+                .default_size(240.0)
+                .size_range(150.0..=320.0)
+                .show_inside(ui, |left| {
+                    // --- Linke Spalte: Steuerleiste & Felder (kompakt) ---
 
                     left.heading("1. Schriftfeld markieren");
                     left.label(
@@ -969,9 +1004,11 @@ impl DrawGrabApp {
                     );
 
                     // --- Rechte Spalte: Interaktiver Canvas (Zoom / Pan / Bounding Box) ---
-                    let right = &mut columns[1];
+                });
 
-                    right.horizontal(|ui| {
+            let right = &mut *ui;
+
+            right.horizontal(|ui| {
                         if ui.button("➖ Zoom -").clicked() {
                             self.teach_in.zoom = (self.teach_in.zoom * 0.85).max(0.15);
                         }
@@ -982,234 +1019,228 @@ impl DrawGrabApp {
                             self.teach_in.zoom = (self.teach_in.zoom * 1.15).min(5.0);
                         }
                         if ui.button("⟲ Ansicht einpassen").clicked() {
-                            self.teach_in.zoom = 0.45;
-                            self.teach_in.pan = egui::Vec2::new(10.0, 10.0);
+                            self.teach_in.fit_request = Some(NormalizedRect::new(0.0, 0.0, 1.0, 1.0));
+                        }
+                        if ui
+                            .button("🔍 Auf Schriftfeld zoomen")
+                            .on_hover_text("Auf das Schriftfeld (markierte Bereiche, sonst rechts unten) einpassen")
+                            .clicked()
+                        {
+                            self.teach_in.fit_request = Some(schriftfeld_rect(&self.teach_in.fields));
                         }
                         ui.separator();
                         ui.small("💡 Linksklick = Rahmen aufziehen | Rechtsklick = Plan verschieben | Mausrad = Zoomen");
                     });
 
-                    let canvas_size = right.available_size();
-                    let (response, painter) =
-                        right.allocate_painter(canvas_size, egui::Sense::click_and_drag());
-                    let canvas_rect = response.rect;
+            let canvas_size = right.available_size();
+            let (response, painter) =
+                right.allocate_painter(canvas_size, egui::Sense::click_and_drag());
+            let canvas_rect = response.rect;
 
-                    // 1. Zoom per Mausrad
-                    if response.hovered() {
-                        let scroll = right.input(|i| i.smooth_scroll_delta.y);
-                        if scroll != 0.0 {
-                            let factor = if scroll > 0.0 { 1.1 } else { 0.9 };
-                            self.teach_in.zoom = (self.teach_in.zoom * factor).clamp(0.15, 6.0);
-                        }
-                    }
+            // 1. Zoom per Mausrad
+            if response.hovered() {
+                let scroll = right.input(|i| i.smooth_scroll_delta.y);
+                if scroll != 0.0 {
+                    let factor = if scroll > 0.0 { 1.1 } else { 0.9 };
+                    self.teach_in.zoom = (self.teach_in.zoom * factor).clamp(0.15, 6.0);
+                }
+            }
 
-                    // 2. Pan per Rechtsklick / Mittelklick
-                    let is_panning = right.input(|i| {
-                        i.pointer.button_down(egui::PointerButton::Secondary)
-                            || i.pointer.button_down(egui::PointerButton::Middle)
-                    });
-                    if response.dragged() && is_panning {
-                        self.teach_in.pan += response.drag_delta();
-                    }
+            // 2. Pan per Rechtsklick / Mittelklick
+            let is_panning = right.input(|i| {
+                i.pointer.button_down(egui::PointerButton::Secondary)
+                    || i.pointer.button_down(egui::PointerButton::Middle)
+            });
+            if response.dragged() && is_panning {
+                self.teach_in.pan += response.drag_delta();
+            }
 
-                    // 3. Bildfläche berechnen
-                    let img_w = self.teach_in.image_width * self.teach_in.zoom;
-                    let img_h = self.teach_in.image_height * self.teach_in.zoom;
-                    let img_rect = egui::Rect::from_min_size(
-                        canvas_rect.min + self.teach_in.pan,
-                        egui::vec2(img_w, img_h),
+            // 3. Bildfläche berechnen
+            // Angefordertes Einpassen (Ganze Seite / Schriftfeld) einmalig anwenden.
+            if let Some(r) = self.teach_in.fit_request.take() {
+                let nw = self.teach_in.image_width.max(1.0);
+                let nh = self.teach_in.image_height.max(1.0);
+                let (z, pn) = fit_normalized_rect(canvas_rect, nw, nh, r, 0.05);
+                self.teach_in.zoom = z;
+                self.teach_in.pan = pn;
+            }
+            let img_w = self.teach_in.image_width * self.teach_in.zoom;
+            let img_h = self.teach_in.image_height * self.teach_in.zoom;
+            let img_rect = egui::Rect::from_min_size(
+                canvas_rect.min + self.teach_in.pan,
+                egui::vec2(img_w, img_h),
+            );
+
+            // Hintergrund
+            painter.rect_filled(canvas_rect, 4.0, egui::Color32::from_rgb(28, 30, 34));
+
+            if let Some(ref texture) = self.teach_in.texture {
+                painter.image(
+                    texture.id(),
+                    img_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                painter.rect_stroke(
+                    img_rect,
+                    0.0,
+                    egui::Stroke::new(1.0, egui::Color32::GRAY),
+                    egui::StrokeKind::Outside,
+                );
+            } else {
+                let msg = if self.teach_in.loading {
+                    "PDF wird geladen & gerendert …"
+                } else {
+                    "Keine PDF geladen – links auf „📄 Beispiel-PDF wählen …“ klicken"
+                };
+                painter.text(
+                    canvas_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    msg,
+                    egui::FontId::proportional(16.0),
+                    egui::Color32::LIGHT_GRAY,
+                );
+            }
+
+            // 4. Bereits konfigurierte Felder auf dem Plan einzeichnen
+            for field in &self.teach_in.fields {
+                if let Some(norm_rect) = field.rect {
+                    let screen_min = img_rect.min
+                        + egui::vec2(
+                            norm_rect.x0 * img_rect.width(),
+                            norm_rect.y0 * img_rect.height(),
+                        );
+                    let screen_max = img_rect.min
+                        + egui::vec2(
+                            norm_rect.x1 * img_rect.width(),
+                            norm_rect.y1 * img_rect.height(),
+                        );
+                    let field_screen_rect = egui::Rect::from_min_max(screen_min, screen_max);
+
+                    let mut fill = field.color;
+                    fill = egui::Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 45);
+                    painter.rect_filled(field_screen_rect, 2.0, fill);
+                    painter.rect_stroke(
+                        field_screen_rect,
+                        2.0,
+                        egui::Stroke::new(2.0, field.color),
+                        egui::StrokeKind::Outside,
                     );
 
-                    // Hintergrund
-                    painter.rect_filled(
-                        canvas_rect,
-                        4.0,
-                        egui::Color32::from_rgb(28, 30, 34),
-                    );
-
-                    if let Some(ref texture) = self.teach_in.texture {
-                        painter.image(
-                            texture.id(),
-                            img_rect,
-                            egui::Rect::from_min_max(
-                                egui::pos2(0.0, 0.0),
-                                egui::pos2(1.0, 1.0),
-                            ),
-                            egui::Color32::WHITE,
-                        );
-                        painter.rect_stroke(
-                            img_rect,
-                            0.0,
-                            egui::Stroke::new(1.0, egui::Color32::GRAY),
-                            egui::StrokeKind::Outside,
-                        );
+                    // Beschriftung über der Box
+                    let badge_text = if field.preview_text.is_empty() {
+                        field.label.to_string()
                     } else {
-                        let msg = if self.teach_in.loading {
-                            "PDF wird geladen & gerendert …"
-                        } else {
-                            "Keine PDF geladen – links auf „📄 Beispiel-PDF wählen …“ klicken"
-                        };
-                        painter.text(
-                            canvas_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            msg,
-                            egui::FontId::proportional(16.0),
-                            egui::Color32::LIGHT_GRAY,
-                        );
-                    }
+                        let snippet: String = field.preview_text.chars().take(22).collect();
+                        format!("{}: \"{}\"", field.label, snippet)
+                    };
+                    let badge_pos = field_screen_rect.left_top() - egui::vec2(0.0, 18.0);
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(
+                            badge_pos,
+                            egui::vec2(badge_text.len() as f32 * 7.0 + 8.0, 18.0),
+                        ),
+                        3.0,
+                        field.color,
+                    );
+                    painter.text(
+                        badge_pos + egui::vec2(4.0, 2.0),
+                        egui::Align2::LEFT_TOP,
+                        badge_text,
+                        egui::FontId::proportional(11.0),
+                        egui::Color32::WHITE,
+                    );
+                }
+            }
 
-                    // 4. Bereits konfigurierte Felder auf dem Plan einzeichnen
-                    for field in &self.teach_in.fields {
-                        if let Some(norm_rect) = field.rect {
-                            let screen_min = img_rect.min
-                                + egui::vec2(
-                                    norm_rect.x0 * img_rect.width(),
-                                    norm_rect.y0 * img_rect.height(),
-                                );
-                            let screen_max = img_rect.min
-                                + egui::vec2(
-                                    norm_rect.x1 * img_rect.width(),
-                                    norm_rect.y1 * img_rect.height(),
-                                );
-                            let field_screen_rect =
-                                egui::Rect::from_min_max(screen_min, screen_max);
+            // 5. Interaktives Aufziehen mit Linksklick
+            if self.teach_in.texture.is_some() && !is_panning {
+                let pointer_pos = right.input(|i| i.pointer.interact_pos());
+                let primary_down = right.input(|i| i.pointer.primary_down());
+                let primary_clicked = response.drag_started_by(egui::PointerButton::Primary);
+                let primary_released = right.input(|i| i.pointer.primary_released());
 
-                            let mut fill = field.color;
-                            fill = egui::Color32::from_rgba_unmultiplied(
-                                fill.r(),
-                                fill.g(),
-                                fill.b(),
-                                45,
-                            );
-                            painter.rect_filled(field_screen_rect, 2.0, fill);
-                            painter.rect_stroke(
-                                field_screen_rect,
-                                2.0,
-                                egui::Stroke::new(2.0, field.color),
-                                egui::StrokeKind::Outside,
-                            );
-
-                            // Beschriftung über der Box
-                            let badge_text = if field.preview_text.is_empty() {
-                                field.label.to_string()
-                            } else {
-                                let snippet: String =
-                                    field.preview_text.chars().take(22).collect();
-                                format!("{}: \"{}\"", field.label, snippet)
-                            };
-                            let badge_pos = field_screen_rect.left_top() - egui::vec2(0.0, 18.0);
-                            painter.rect_filled(
-                                egui::Rect::from_min_size(
-                                    badge_pos,
-                                    egui::vec2(badge_text.len() as f32 * 7.0 + 8.0, 18.0),
-                                ),
-                                3.0,
-                                field.color,
-                            );
-                            painter.text(
-                                badge_pos + egui::vec2(4.0, 2.0),
-                                egui::Align2::LEFT_TOP,
-                                badge_text,
-                                egui::FontId::proportional(11.0),
-                                egui::Color32::WHITE,
-                            );
+                if primary_clicked {
+                    if let Some(pos) = pointer_pos {
+                        if img_rect.contains(pos) {
+                            self.teach_in.drag_start = Some(pos);
+                            self.teach_in.drag_current = Some(pos);
                         }
                     }
+                } else if primary_down && self.teach_in.drag_start.is_some() {
+                    if let Some(pos) = pointer_pos {
+                        self.teach_in.drag_current = Some(pos);
+                    }
+                }
 
-                    // 5. Interaktives Aufziehen mit Linksklick
-                    if self.teach_in.texture.is_some() && !is_panning {
-                        let pointer_pos = right.input(|i| i.pointer.interact_pos());
-                        let primary_down = right.input(|i| i.pointer.primary_down());
-                        let primary_clicked = response.drag_started_by(egui::PointerButton::Primary);
-                        let primary_released = right.input(|i| i.pointer.primary_released());
+                // Aktuelles Live-Rechteck zeichnen
+                if let (Some(start), Some(curr)) =
+                    (self.teach_in.drag_start, self.teach_in.drag_current)
+                {
+                    let drag_rect = egui::Rect::from_two_pos(start, curr);
+                    let active_color = self.teach_in.fields[self.teach_in.active_field_index].color;
+                    let fill = egui::Color32::from_rgba_unmultiplied(
+                        active_color.r(),
+                        active_color.g(),
+                        active_color.b(),
+                        60,
+                    );
+                    painter.rect_filled(drag_rect, 2.0, fill);
+                    painter.rect_stroke(
+                        drag_rect,
+                        2.0,
+                        egui::Stroke::new(2.0, active_color),
+                        egui::StrokeKind::Outside,
+                    );
+                }
 
-                        if primary_clicked {
-                            if let Some(pos) = pointer_pos {
-                                if img_rect.contains(pos) {
-                                    self.teach_in.drag_start = Some(pos);
-                                    self.teach_in.drag_current = Some(pos);
-                                }
+                // Beim Loslassen der Maus Feld speichern
+                if primary_released {
+                    if let (Some(start), Some(curr)) = (
+                        self.teach_in.drag_start.take(),
+                        self.teach_in.drag_current.take(),
+                    ) {
+                        let min_x = start.x.min(curr.x);
+                        let max_x = start.x.max(curr.x);
+                        let min_y = start.y.min(curr.y);
+                        let max_y = start.y.max(curr.y);
+
+                        if (max_x - min_x) > 6.0 && (max_y - min_y) > 6.0 {
+                            let u0 = ((min_x - img_rect.min.x) / img_rect.width()).clamp(0.0, 1.0);
+                            let v0 = ((min_y - img_rect.min.y) / img_rect.height()).clamp(0.0, 1.0);
+                            let u1 = ((max_x - img_rect.min.x) / img_rect.width()).clamp(0.0, 1.0);
+                            let v1 = ((max_y - img_rect.min.y) / img_rect.height()).clamp(0.0, 1.0);
+
+                            let norm_rect = NormalizedRect::new(u0, v0, u1, v1);
+                            let active_idx = self.teach_in.active_field_index;
+                            self.teach_in.fields[active_idx].rect = Some(norm_rect);
+
+                            if let Some(ref pdata) = self.teach_in.page_data {
+                                let text = template::extract_field_text(pdata, &norm_rect);
+                                self.teach_in.fields[active_idx].preview_text = text.clone();
+                                self.teach_in.status_msg = if text.is_empty() {
+                                    format!(
+                                        "Feld „{}“ markiert (Kein Text im Bereich)",
+                                        self.teach_in.fields[active_idx].label
+                                    )
+                                } else {
+                                    format!(
+                                        "Feld „{}“ erkannt: \"{}\"",
+                                        self.teach_in.fields[active_idx].label, text
+                                    )
+                                };
                             }
-                        } else if primary_down && self.teach_in.drag_start.is_some() {
-                            if let Some(pos) = pointer_pos {
-                                self.teach_in.drag_current = Some(pos);
-                            }
-                        }
 
-                        // Aktuelles Live-Rechteck zeichnen
-                        if let (Some(start), Some(curr)) =
-                            (self.teach_in.drag_start, self.teach_in.drag_current)
-                        {
-                            let drag_rect = egui::Rect::from_two_pos(start, curr);
-                            let active_color =
-                                self.teach_in.fields[self.teach_in.active_field_index].color;
-                            let fill = egui::Color32::from_rgba_unmultiplied(
-                                active_color.r(),
-                                active_color.g(),
-                                active_color.b(),
-                                60,
-                            );
-                            painter.rect_filled(drag_rect, 2.0, fill);
-                            painter.rect_stroke(
-                                drag_rect,
-                                2.0,
-                                egui::Stroke::new(2.0, active_color),
-                                egui::StrokeKind::Outside,
-                            );
-                        }
-
-                        // Beim Loslassen der Maus Feld speichern
-                        if primary_released {
-                            if let (Some(start), Some(curr)) =
-                                (self.teach_in.drag_start.take(), self.teach_in.drag_current.take())
+                            // Zum nächsten noch unkonfigurierten Feld wechseln
+                            if let Some(next) =
+                                (0..4).find(|&idx| self.teach_in.fields[idx].rect.is_none())
                             {
-                                let min_x = start.x.min(curr.x);
-                                let max_x = start.x.max(curr.x);
-                                let min_y = start.y.min(curr.y);
-                                let max_y = start.y.max(curr.y);
-
-                                if (max_x - min_x) > 6.0 && (max_y - min_y) > 6.0 {
-                                    let u0 = ((min_x - img_rect.min.x) / img_rect.width())
-                                        .clamp(0.0, 1.0);
-                                    let v0 = ((min_y - img_rect.min.y) / img_rect.height())
-                                        .clamp(0.0, 1.0);
-                                    let u1 = ((max_x - img_rect.min.x) / img_rect.width())
-                                        .clamp(0.0, 1.0);
-                                    let v1 = ((max_y - img_rect.min.y) / img_rect.height())
-                                        .clamp(0.0, 1.0);
-
-                                    let norm_rect = NormalizedRect::new(u0, v0, u1, v1);
-                                    let active_idx = self.teach_in.active_field_index;
-                                    self.teach_in.fields[active_idx].rect = Some(norm_rect);
-
-                                    if let Some(ref pdata) = self.teach_in.page_data {
-                                        let text = template::extract_field_text(pdata, &norm_rect);
-                                        self.teach_in.fields[active_idx].preview_text =
-                                            text.clone();
-                                        self.teach_in.status_msg = if text.is_empty() {
-                                            format!(
-                                                "Feld „{}“ markiert (Kein Text im Bereich)",
-                                                self.teach_in.fields[active_idx].label
-                                            )
-                                        } else {
-                                            format!(
-                                                "Feld „{}“ erkannt: \"{}\"",
-                                                self.teach_in.fields[active_idx].label, text
-                                            )
-                                        };
-                                    }
-
-                                    // Zum nächsten noch unkonfigurierten Feld wechseln
-                                    if let Some(next) = (0..4)
-                                        .find(|&idx| self.teach_in.fields[idx].rect.is_none())
-                                    {
-                                        self.teach_in.active_field_index = next;
-                                    }
-                                }
+                                self.teach_in.active_field_index = next;
                             }
                         }
                     }
-                });
+                }
+            }
         }
     }
 }
@@ -1562,6 +1593,62 @@ impl eframe::App for DrawGrabApp {
 }
 
 /// Farbe je Feld-Schlüssel für die Bereichs-Einrahmung.
+/// Berechnet (zoom, pan), um einen normalisierten Bereich (0..1) in den Canvas einzupassen.
+/// `margin` = relativer Rand (z. B. 0.02). Canvas = Zielrechteck; Bild natürlich `nat_w`x`nat_h`.
+/// Bereich, auf den bei „Auf Schriftfeld zoomen" eingepasst wird:
+/// Vereinigung der markierten Felder, sonst Standard-Schriftfeld rechts unten.
+fn schriftfeld_rect(fields: &[TeachInField]) -> NormalizedRect {
+    let mut iter = fields.iter().filter_map(|f| f.rect);
+    if let Some(first) = iter.next() {
+        let mut x0 = first.x0;
+        let mut y0 = first.y0;
+        let mut x1 = first.x1;
+        let mut y1 = first.y1;
+        for r in iter {
+            x0 = x0.min(r.x0);
+            y0 = y0.min(r.y0);
+            x1 = x1.max(r.x1);
+            y1 = y1.max(r.y1);
+        }
+        // kleiner Rand
+        return NormalizedRect::new(
+            (x0 - 0.02).max(0.0),
+            (y0 - 0.02).max(0.0),
+            (x1 + 0.02).min(1.0),
+            (y1 + 0.02).min(1.0),
+        );
+    }
+    // typisches Schriftfeld rechts unten
+    NormalizedRect::new(0.5, 0.80, 1.0, 1.0)
+}
+
+fn fit_normalized_rect(
+    canvas: egui::Rect,
+    nat_w: f32,
+    nat_h: f32,
+    rect: NormalizedRect,
+    margin: f32,
+) -> (f32, egui::Vec2) {
+    let nat_w = nat_w.max(1.0);
+    let nat_h = nat_h.max(1.0);
+    let region_w = (rect.width() * nat_w).max(1.0);
+    let region_h = (rect.height() * nat_h).max(1.0);
+    let region_cx = (rect.x0 + rect.x1) * 0.5 * nat_w;
+    let region_cy = (rect.y0 + rect.y1) * 0.5 * nat_h;
+
+    let cw = canvas.width().max(1.0);
+    let ch = canvas.height().max(1.0);
+    let margin = margin.clamp(0.0, 0.45);
+    let avail_w = (cw * (1.0 - 2.0 * margin)).max(1.0);
+    let avail_h = (ch * (1.0 - 2.0 * margin)).max(1.0);
+    let zoom = (avail_w / region_w).min(avail_h / region_h).max(0.01);
+
+    // Bildursprung so, dass der Bereich in der Canvas-Mitte liegt:
+    // canvas.center == canvas.min + pan + region_center * zoom
+    let pan = (canvas.center() - canvas.min) - egui::vec2(region_cx * zoom, region_cy * zoom);
+    (zoom, pan)
+}
+
 fn region_color(key: &str) -> egui::Color32 {
     match key {
         "zeichnung" => egui::Color32::from_rgb(33, 150, 243), // Blau
