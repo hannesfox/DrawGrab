@@ -131,7 +131,20 @@ fn sanitize_id(s: &str) -> String {
 
 /// Extrahiert und bereinigt den Text innerhalb eines normierten Rechtecks.
 pub fn extract_field_text(page: &PageData, rect: &NormalizedRect) -> String {
-    if page.width <= 0.0 || page.height <= 0.0 {
+    if !page.width.is_finite()
+        || !page.height.is_finite()
+        || page.width <= 0.0
+        || page.height <= 0.0
+    {
+        return String::new();
+    }
+
+    // Rechteck auf endliche Werte prüfen (templates.json kann ungeprüft geladen werden).
+    if !rect.x0.is_finite()
+        || !rect.y0.is_finite()
+        || !rect.x1.is_finite()
+        || !rect.y1.is_finite()
+    {
         return String::new();
     }
 
@@ -140,10 +153,16 @@ pub fn extract_field_text(page: &PageData, rect: &NormalizedRect) -> String {
     let abs_x1 = rect.x1 * page.width;
     let abs_y1 = rect.y1 * page.height;
 
+    // Wörter mit nicht-endlichen Koordinaten ignorieren (sie könnten die Sortierung stören).
+    let sane = |w: &&Word| {
+        w.x0.is_finite() && w.y0.is_finite() && w.x1.is_finite() && w.y1.is_finite() && w.size.is_finite()
+    };
+
     // Zuerst Wörter finden, deren Zentrum in der Box liegt
     let mut words: Vec<&Word> = page
         .words
         .iter()
+        .filter(|w| sane(w))
         .filter(|w| {
             let cx = (w.x0 + w.x1) * 0.5;
             let cy = (w.y0 + w.y1) * 0.5;
@@ -156,6 +175,7 @@ pub fn extract_field_text(page: &PageData, rect: &NormalizedRect) -> String {
         words = page
             .words
             .iter()
+            .filter(|w| sane(w))
             .filter(|w| !(w.x1 < abs_x0 || w.x0 > abs_x1 || w.y1 < abs_y0 || w.y0 > abs_y1))
             .collect();
     }
@@ -165,15 +185,7 @@ pub fn extract_field_text(page: &PageData, rect: &NormalizedRect) -> String {
     }
 
     // Wörter in natürlicher Leserichtung sortieren (Zeilenweise von oben nach unten, links nach rechts)
-    words.sort_by(|a, b| {
-        let y_diff = (a.y0 - b.y0).abs();
-        let line_height = (a.size.max(b.size) * 0.5).max(3.5);
-        if y_diff < line_height {
-            a.x0.total_cmp(&b.x0)
-        } else {
-            a.y0.total_cmp(&b.y0)
-        }
-    });
+    sort_reading_order(&mut words);
 
     let raw_text = words
         .iter()
@@ -182,6 +194,51 @@ pub fn extract_field_text(page: &PageData, rect: &NormalizedRect) -> String {
         .join(" ");
 
     clean_text(&raw_text)
+}
+
+/// Sortiert Wörter in natürlicher Leserichtung: Zeilen von oben nach unten,
+/// innerhalb einer Zeile links nach rechts.
+///
+/// Liefert eine **totale Ordnung**. Der frühere Ansatz verglich paarweise
+/// „sind a und b auf derselben Zeile?" und schaltete dann zwischen x- und
+/// y-Sortierung um – das ist **intransitiv** (A<B, B<C, C<A) und ließ
+/// `sort_by` mit „user-provided comparison function does not correctly
+/// implement a total order" panicken. „Gleiche Zeile" kann nicht als
+/// paarweiser Vergleicher ausgedrückt werden; wir gruppieren daher zuerst in
+/// Zeilen (Schlüssel statt Paarvergleich) und sortieren dann stabil.
+fn sort_reading_order(words: &mut Vec<&Word>) {
+    // Sicherheit: nicht-endliche Koordinaten ausschließen.
+    words.retain(|w| {
+        w.x0.is_finite() && w.y0.is_finite() && w.x1.is_finite() && w.y1.is_finite() && w.size.is_finite()
+    });
+
+    if words.len() < 2 {
+        return;
+    }
+
+    // 1) Deterministische Total-Order-Basissortierung (y, dann x; total_cmp inkl. NaN).
+    words.sort_by(|a, b| a.y0.total_cmp(&b.y0).then_with(|| a.x0.total_cmp(&b.x0)));
+
+    // 2) In Zeilen gruppieren (gleiche Höhe/Grundlinie). Zeilenhöhe je Wort.
+    let mut lines: Vec<Vec<&Word>> = Vec::new();
+    for w in words.drain(..) {
+        let line_height = (w.size * 0.5).max(3.5);
+        match lines.last_mut() {
+            Some(line) if (w.y0 - line[0].y0).abs() < line_height => line.push(w),
+            _ => lines.push(vec![w]),
+        }
+    }
+
+    // 3) Zeilen nach y ordnen (Basissortierung hält das bereits, hier explizit + total_cmp).
+    lines.sort_by(|a, b| a[0].y0.total_cmp(&b[0].y0));
+
+    // 4) Innerhalb einer Zeile nach x (Total-Order-Tie-Break nach y); flach klopfen.
+    let mut out: Vec<&Word> = Vec::new();
+    for mut line in lines {
+        line.sort_by(|a, b| a.x0.total_cmp(&b.x0).then_with(|| a.y0.total_cmp(&b.y0)));
+        out.extend(line);
+    }
+    *words = out;
 }
 
 /// Säubert den extrahierten Text (Leerzeichen, CID-Sonderzeichen, führende Trennzeichen).
@@ -358,6 +415,9 @@ pub fn templates_path() -> PathBuf {
     }
 
     if let Ok(exe) = std::env::current_exe() {
+        // Symlinks auflösen, damit rohe Binary und .app-Bundle (Contents/MacOS-Symlink)
+        // dasselbe exe-Verzeichnis (und damit dasselbe templates.json) finden.
+        let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
         if let Some(parent) = exe.parent() {
             let p = parent.join("templates.json");
             if p.exists() {
@@ -433,6 +493,74 @@ mod tests {
 
         let rect_bez = NormalizedRect::new(0.09, 0.14, 0.22, 0.17);
         assert_eq!(extract_field_text(&page, &rect_bez), "DRUCKBOLZEN");
+    }
+
+    /// Regression: der frühere paarweise Vergleicher war intransitiv und ließ
+    /// `sort_by` mit "total order"-Panic abstürzen. Baut einen intransitiven
+    /// 3-Zyklus (A<B, B<C, C<A unter altem Vergleicher) und verlangt Ruhe.
+    #[test]
+    fn test_extract_field_text_intransitive_words_no_panic() {
+        let mk = |text: &str, x0: f32, y0: f32| Word {
+            text: text.to_string(),
+            x0,
+            y0,
+            x1: x0 + 5.0,
+            y1: y0 + 5.0,
+            size: 7.0,
+            baseline: y0 + 5.0,
+        };
+        // line_height = 3.5; A<B (x), B<C (y), C<A (x) im alten Vergleicher.
+        let words = vec![
+            mk("A", 100.0, 100.0),
+            mk("B", 110.0, 98.0),
+            mk("C", 10.0, 103.0),
+        ];
+        let page = PageData {
+            width: 1000.0,
+            height: 1000.0,
+            words,
+            hsegs: vec![],
+            vsegs: vec![],
+        };
+        let rect = NormalizedRect::new(0.0, 0.0, 1.0, 1.0);
+        // Darf nicht panicken; Reihenfolge deterministisch.
+        let out = extract_field_text(&page, &rect);
+        assert!(!out.is_empty());
+    }
+
+    /// Nicht-endliche Koordinaten (NaN/inf) dürfen weder panicken noch Text liefern.
+    #[test]
+    fn test_extract_field_text_non_finite_ignored() {
+        let mut bad = Word {
+            text: "BAD".to_string(),
+            x0: f32::NAN,
+            y0: f32::NAN,
+            x1: f32::NAN,
+            y1: f32::NAN,
+            size: f32::NAN,
+            baseline: f32::NAN,
+        };
+        let good = Word {
+            text: "OK".to_string(),
+            x0: 100.0,
+            y0: 100.0,
+            x1: 150.0,
+            y1: 115.0,
+            size: 12.0,
+            baseline: 112.0,
+        };
+        let page = PageData {
+            width: 1000.0,
+            height: 1000.0,
+            words: vec![bad.clone(), good.clone(), {
+                bad.x0 = f32::INFINITY;
+                bad
+            }],
+            hsegs: vec![],
+            vsegs: vec![],
+        };
+        let rect = NormalizedRect::new(0.09, 0.09, 0.16, 0.12);
+        assert_eq!(extract_field_text(&page, &rect), "OK");
     }
 
     #[test]
