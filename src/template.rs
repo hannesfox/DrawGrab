@@ -436,6 +436,11 @@ fn locate_value(page: &PageData, value: &str) -> Option<NormalizedRect> {
     if needle.len() < 2 {
         return None;
     }
+    // Bestes passendes Wort statt „erster Treffer irgendwo":
+    // exakt > Wort beginnt mit Wert > Wert beginnt mit Wort (mind. 4 Zeichen).
+    // Bewusst KEIN beliebiges `contains`: Das traf Fragmente wie „uss" oder
+    // „lat" irgendwo auf der Seite und setzte den Rahmen an die falsche Stelle.
+    let mut best: Option<(&Word, usize)> = None;
     for w in &page.words {
         if !w.x0.is_finite() || !w.y0.is_finite() || !w.x1.is_finite() || !w.y1.is_finite() {
             continue;
@@ -444,24 +449,32 @@ fn locate_value(page: &PageData, value: &str) -> Option<NormalizedRect> {
         if t.is_empty() {
             continue;
         }
-        let hit = t == needle || t.contains(&needle) || (needle.contains(&t) && t.len() >= 3);
-        if !hit {
+        let score = if t == needle {
+            needle.len() + 2
+        } else if t.starts_with(&needle) {
+            needle.len() + 1
+        } else if needle.starts_with(&t) && t.len() >= 4 {
+            t.len()
+        } else {
             continue;
+        };
+        if best.map_or(true, |(_, bs)| score > bs) {
+            best = Some((w, score));
         }
-        let x0 = (w.x0 / pw).clamp(0.0, 1.0);
-        let y0 = (w.y0 / ph).clamp(0.0, 1.0);
-        let x1 = (w.x1 / pw).clamp(0.0, 1.0);
-        let y1 = (w.y1 / ph).clamp(0.0, 1.0);
-        // etwas Luft rundherum
-        let pad = 0.004_f32;
-        return Some(NormalizedRect::new(
-            (x0 - pad).max(0.0),
-            (y0 - pad).max(0.0),
-            (x1 + pad).min(1.0),
-            (y1 + pad).min(1.0),
-        ));
     }
-    None
+    let (w, _) = best?;
+    let x0 = (w.x0 / pw).clamp(0.0, 1.0);
+    let y0 = (w.y0 / ph).clamp(0.0, 1.0);
+    let x1 = (w.x1 / pw).clamp(0.0, 1.0);
+    let y1 = (w.y1 / ph).clamp(0.0, 1.0);
+    // etwas Luft rundherum
+    let pad = 0.004_f32;
+    Some(NormalizedRect::new(
+        (x0 - pad).max(0.0),
+        (y0 - pad).max(0.0),
+        (x1 + pad).min(1.0),
+        (y1 + pad).min(1.0),
+    ))
 }
 
 /// Kleinschreibung + nur alphanumerisch; `needle` = erstes sinnvolles Token.
@@ -743,6 +756,36 @@ mod tests {
         assert!(locate_value(&page, "NICHTVORHANDEN").is_none());
     }
 
+    /// Regression: Die frühere Teilstring-Suche traf Fragmente wie „uss" (in
+    /// „ANSCHLUSSPLATTE") irgendwo auf der Seite und setzte den Rahmen an die
+    /// falsche Stelle. Es muss das passendste Wort gewinnen.
+    #[test]
+    fn test_locate_value_ignores_fragments_elsewhere() {
+        let mk = |text: &str, x0: f32, y0: f32, x1: f32, y1: f32| Word {
+            text: text.to_string(),
+            x0,
+            y0,
+            x1,
+            y1,
+            size: 10.0,
+            baseline: y1,
+        };
+        let page = PageData {
+            width: 1000.0,
+            height: 1000.0,
+            words: vec![
+                mk("uss", 100.0, 100.0, 120.0, 110.0),
+                mk("ANSCHLUSSPLATT", 700.0, 900.0, 820.0, 920.0),
+                mk("CONNECTING", 700.0, 930.0, 780.0, 950.0),
+            ],
+            hsegs: vec![],
+            vsegs: vec![],
+        };
+        let r = locate_value(&page, "ANSCHLUSSPLATTE / CONNECTING PLATE").expect("gefunden");
+        assert!((r.x0 - 0.7).abs() < 0.01, "x0 = {}", r.x0);
+        assert!((r.y0 - 0.9).abs() < 0.01, "y0 = {}", r.y0);
+    }
+
     /// Regression: der frühere paarweise Vergleicher war intransitiv und ließ
     /// `sort_by` mit "total order"-Panic abstürzen. Baut einen intransitiven
     /// 3-Zyklus (A<B, B<C, C<A unter altem Vergleicher) und verlangt Ruhe.
@@ -935,4 +978,3 @@ mod tests {
         assert_eq!(loaded[0].name, "TestVorlage");
     }
 }
-
